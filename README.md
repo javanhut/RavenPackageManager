@@ -145,6 +145,40 @@ cd RavenPackageManager
 make install
 ```
 
+## Uninstalling rvn
+
+Removes the `rvn` binary itself. Packages installed with it are left in place —
+use `rvn uninstall <pkg>` for those.
+
+### ImLazy
+
+```bash
+imlazy uninstall
+```
+
+### Make
+
+```bash
+make uninstall
+```
+
+## Install Location
+
+Both runners install to `/usr/local/bin`, so writing there may need `sudo`.
+Point them somewhere else with a prefix:
+
+```bash
+imlazy install prefix=$HOME/.local   # installs to $HOME/.local/bin/rvn
+make install PREFIX=$HOME/.local
+```
+
+Uninstalling takes the same prefix, and must match the one used to install:
+
+```bash
+imlazy uninstall prefix=$HOME/.local
+make uninstall PREFIX=$HOME/.local
+```
+
 # Quick Start
 
 ### Version Command

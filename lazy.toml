@@ -1,37 +1,58 @@
 # ImLazy configuration file
 
 [settings]
-# default = "build"  # Uncomment to set default command
-# parallel = false   # Enable parallel dependency execution
-# include = ["ci.toml"]  # Include other config files
-# env_file = [".env", ".env.local"]  # Dotenv files to load
+default = "build"
 
 [variables]
-# name = "myproject"
-# output_dir = "bin"
-
-[env]
-# GO111MODULE = "on"
+prefix = "/usr/local"
+bindir = "{{prefix}}/bin"
+binary = "rvn"
+target = "target/release/{{binary}}"
 
 [commands]
 
-[commands.example]
-desc = "An example command"
-run = ["echo Hello from imlazy!"]
-# alias = ["ex", "e"]  # Uncomment to add aliases
-# dep = []  # Add dependencies here
-# env = {}  # Add environment variables here
-# watch = ["**/*.go"]  # Watch patterns for watch mode
-# if_changed = ["src/**/*.go"]  # Only run if these files changed
-# dir = "subdir"  # Working directory for this command
-# timeout = "5m"  # Timeout for command execution
-# pre = ["lint"]  # Commands to run before
-# post = ["notify"]  # Commands to run after (on success)
-# retry = 2  # Number of retries on failure
-# retry_delay = "1s"  # Delay between retries
+[commands.build]
+desc = "Build release binary"
+alias = ["b"]
+run = ["cargo build --locked --release"]
 
-# Platform-specific commands (use run.linux, run.darwin, run.windows)
-# [commands.build]
-# run.linux = ["go build -o app"]
-# run.darwin = ["go build -o app"]
-# run.windows = ["go build -o app.exe"]
+[commands.test]
+desc = "Run all tests"
+alias = ["t"]
+run = ["cargo test --locked --all-targets"]
+
+[commands.check]
+desc = "Run formatting, Clippy, and the full locked test suite"
+run = [
+  "cargo fmt --check",
+  "cargo clippy --locked --all-targets -- -D warnings",
+  "cargo test --locked --all-targets",
+]
+
+[commands.format]
+desc = "Format the code with rustfmt"
+alias = ["fmt", "f"]
+run = ["cargo fmt --all"]
+
+[commands.install]
+desc = "Install rvn to /usr/local/bin (may need sudo)"
+dep = ["build"]
+run = [
+  "echo \"Installing {{binary}} to {{bindir}}...\"",
+  "install -d {{bindir}}",
+  "install -m 755 {{target}} {{bindir}}/{{binary}}",
+  "echo \"Installed {{binary}} to {{bindir}}/{{binary}}\"",
+  "echo \"Run 'rvn --version' to verify.\"",
+]
+
+[commands.uninstall]
+desc = "Uninstall rvn from /usr/local/bin (may need sudo)"
+run = [
+  "echo \"Removing {{bindir}}/{{binary}}...\"",
+  "rm -f {{bindir}}/{{binary}}",
+  "echo \"Uninstalled {{binary}}\"",
+]
+
+[commands.clean]
+desc = "Clean build artifacts"
+run = ["cargo clean"]
