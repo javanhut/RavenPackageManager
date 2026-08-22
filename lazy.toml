@@ -14,7 +14,7 @@ target = "target/release/{{binary}}"
 [commands.build]
 desc = "Build release binary"
 alias = ["b"]
-run = ["cargo build --locked --release"]
+run = ["cargo build --release"]
 
 [commands.test]
 desc = "Run all tests"
