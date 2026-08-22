@@ -8,6 +8,15 @@ use crate::pkg::{InstallReason, Origin, Package};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Seconds since the epoch, or 0 if the clock is before it.
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Default)]
 pub struct LocalDb {
@@ -55,6 +64,21 @@ impl LocalDb {
         self.packages.values().find(|p| p.satisfies(dep))
     }
 
+    /// The files owned by a package, treating "no record" as "owns nothing"
+    /// but surfacing real I/O failures.
+    ///
+    /// The distinction matters: callers use this to decide what to delete, and
+    /// treating an unreadable file list as an empty one would let another
+    /// package's files look unowned.
+    pub fn files_or_empty(&self, name: &str) -> io::Result<Vec<String>> {
+        match self.files(name) {
+            Ok(files) => Ok(files),
+            // A metapackage records no file list at all, which is legitimate.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// The files owned by an installed package, as recorded in its `files`.
     pub fn files(&self, name: &str) -> io::Result<Vec<String>> {
         let pkg = self
@@ -84,6 +108,43 @@ impl LocalDb {
             std::fs::remove_dir_all(&dir)?;
         }
         Ok(())
+    }
+
+    /// Registers a freshly installed package, storing the `.MTREE` pacman needs
+    /// for its full integrity check (`pacman -Qkk`) and the `.INSTALL`
+    /// scriptlet whose removal hooks run long after installation.
+    pub fn register_with_mtree(
+        &mut self,
+        pkg: &Package,
+        files: &[String],
+        mtree: Option<&[u8]>,
+        install_script: Option<&[u8]>,
+        install_script_mtime: Option<u64>,
+    ) -> io::Result<()> {
+        self.register(pkg, files)?;
+        let dir = self.root.join(format!("{}-{}", pkg.name, pkg.version));
+        if let Some(mtree) = mtree {
+            std::fs::write(dir.join("mtree"), mtree)?;
+        }
+        if let Some(script) = install_script {
+            let path = dir.join("install");
+            std::fs::write(&path, script)?;
+            // The `.MTREE` records the scriptlet's timestamp, and `pacman
+            // -Qkk` checks the stored copy against it. Writing it with the
+            // current time reads as a modified file.
+            if let Some(mtime) = install_script_mtime {
+                let stamp = filetime::FileTime::from_unix_time(mtime as i64, 0);
+                let _ = filetime::set_file_times(&path, stamp, stamp);
+            }
+        }
+        Ok(())
+    }
+
+    /// The stored `.INSTALL` scriptlet for an installed package, if it has one.
+    pub fn install_script(&self, name: &str) -> Option<Vec<u8>> {
+        let pkg = self.get(name)?;
+        let dir = self.root.join(format!("{}-{}", pkg.name, pkg.version));
+        std::fs::read(dir.join("install")).ok()
     }
 
     /// Registers a freshly installed package by writing its `desc` and `files`.
@@ -122,14 +183,31 @@ impl LocalDb {
 
         field("NAME", &[pkg.name.clone()]);
         field("VERSION", &[pkg.version.clone()]);
+        if let Some(base) = &pkg.base {
+            field("BASE", &[base.clone()]);
+        }
         field("DESC", &[pkg.description.clone()]);
         if let Some(url) = &pkg.url {
             field("URL", &[url.clone()]);
         }
+        if let Some(arch) = &pkg.arch {
+            field("ARCH", &[arch.clone()]);
+        }
         field("LICENSE", &pkg.licenses);
         field("GROUPS", &pkg.groups);
-        field("ISIZE", &[pkg.isize.to_string()]);
+        if pkg.build_date > 0 {
+            field("BUILDDATE", &[pkg.build_date.to_string()]);
+        }
+        field("INSTALLDATE", &[now_unix().to_string()]);
+        if let Some(packager) = &pkg.packager {
+            field("PACKAGER", &[packager.clone()]);
+        }
+        // The local database names the installed size SIZE, not ISIZE;
+        // writing the wrong key makes pacman report a size of zero.
+        field("SIZE", &[pkg.isize.to_string()]);
         field("REASON", &[pkg.install_reason.as_code().to_string()]);
+        field("VALIDATION", &[pkg.validation.as_str().to_string()]);
+        field("XDATA", &["pkgtype=pkg".to_string()]);
         field(
             "BACKUP",
             &pkg.backup.iter().map(|b| b.to_entry()).collect::<Vec<_>>(),
@@ -236,6 +314,70 @@ mod tests {
         // modified config from an untouched one.
         assert_eq!(got.backup_hash("etc/demo.conf"), Some("feedface"));
         assert_eq!(reread.dependencies().count(), 1);
+    }
+
+    #[test]
+    fn writes_the_fields_pacman_reads() {
+        let root = temp_root("pacman-fields");
+        let mut db = LocalDb::load(&root);
+
+        let pkg = Package {
+            name: "demo".into(),
+            version: "1.0-1".into(),
+            base: Some("demo".into()),
+            arch: Some("aarch64".into()),
+            packager: Some("Someone <a@b.c>".into()),
+            build_date: 1_700_000_000,
+            isize: 4096,
+            validation: crate::pkg::Validation::Pgp,
+            ..Default::default()
+        };
+        db.register_with_mtree(
+            &pkg,
+            &["usr/bin/demo".into()],
+            Some(b"#mtree fake"),
+            Some(b"post_install() { :; }"),
+            Some(1_700_000_000),
+        )
+        .unwrap();
+
+        let desc = std::fs::read_to_string(root.join("demo-1.0-1/desc")).unwrap();
+        // SIZE, not ISIZE: pacman reads the former from a local database.
+        assert!(desc.contains("%SIZE%\n4096"), "desc was: {desc}");
+        assert!(!desc.contains("%ISIZE%"));
+        assert!(desc.contains("%VALIDATION%\npgp"));
+        assert!(desc.contains("%ARCH%\naarch64"));
+        assert!(desc.contains("%BASE%\ndemo"));
+        assert!(desc.contains("%BUILDDATE%\n1700000000"));
+        assert!(desc.contains("%PACKAGER%\nSomeone"));
+        assert!(desc.contains("%XDATA%\npkgtype=pkg"));
+
+        // An install date must be recorded and be a plausible timestamp.
+        let installdate: u64 = desc
+            .split("%INSTALLDATE%\n")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .and_then(|v| v.parse().ok())
+            .expect("INSTALLDATE");
+        assert!(installdate > 1_600_000_000, "got {installdate}");
+
+        assert!(root.join("demo-1.0-1/mtree").exists());
+        // The scriptlet must survive so removal hooks can still run.
+        assert!(root.join("demo-1.0-1/install").exists());
+        assert_eq!(
+            db.install_script("demo").as_deref(),
+            Some(&b"post_install() { :; }"[..])
+        );
+        // The scriptlet's timestamp must match what the archive recorded.
+        let meta = std::fs::metadata(root.join("demo-1.0-1/install")).unwrap();
+        assert_eq!(
+            filetime::FileTime::from_last_modification_time(&meta).unix_seconds(),
+            1_700_000_000
+        );
+
+        // And the size must survive a round trip through the parser.
+        let reread = LocalDb::load(&root);
+        assert_eq!(reread.get("demo").unwrap().isize, 4096);
     }
 
     #[test]

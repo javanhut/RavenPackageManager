@@ -41,11 +41,25 @@ fn cli() -> Command {
         )
         .arg(
             Arg::new("yes")
-                .long("noconfirm")
+                .long("yes")
                 .short('y')
                 .global(true)
                 .action(ArgAction::SetTrue)
-                .help("Answer every prompt affirmatively"),
+                .help("Assume yes for every prompt"),
+        )
+        .arg(
+            Arg::new("keep-cache")
+                .long("keep-cache")
+                .global(true)
+                .action(ArgAction::SetTrue)
+                .help("Keep downloaded packages instead of clearing them afterwards"),
+        )
+        .arg(
+            Arg::new("no-sync")
+                .long("no-sync")
+                .global(true)
+                .action(ArgAction::SetTrue)
+                .help("Never refresh repository databases automatically"),
         )
         // Install package
         .subcommand(
@@ -72,11 +86,10 @@ fn cli() -> Command {
                         .help("Also remove packages that depend on the targets"),
                 )
                 .arg(
-                    Arg::new("recursive")
-                        .long("recursive")
-                        .short('r')
+                    Arg::new("keep-orphans")
+                        .long("keep-orphans")
                         .action(ArgAction::SetTrue)
-                        .help("Also remove dependencies that become orphaned"),
+                        .help("Leave behind dependencies nothing needs any more"),
                 )
                 .arg(
                     Arg::new("nodeps")
@@ -124,7 +137,52 @@ fn cli() -> Command {
                         .value_name("N")
                         .default_value("20")
                         .help("Maximum results to show"),
+                )
+                .arg(
+                    Arg::new("no-select")
+                        .long("no-select")
+                        .action(ArgAction::SetTrue)
+                        .help("Print results without offering to install them"),
                 ),
+        )
+        .subcommand(
+            Command::new("info")
+                .about("Shows everything known about a package.")
+                .arg(packages_arg("Package(s) to describe")),
+        )
+        .subcommand(
+            Command::new("list")
+                .short_flag('l')
+                .about("Lists installed packages.")
+                .arg(
+                    Arg::new("orphans")
+                        .long("orphans")
+                        .action(ArgAction::SetTrue)
+                        .help("Only dependencies nothing needs any more"),
+                )
+                .arg(
+                    Arg::new("foreign")
+                        .long("foreign")
+                        .action(ArgAction::SetTrue)
+                        .help("Only packages no repository carries (AUR or hand-built)"),
+                )
+                .arg(
+                    Arg::new("explicit")
+                        .long("explicit")
+                        .action(ArgAction::SetTrue)
+                        .help("Only packages installed by name"),
+                ),
+        )
+        .subcommand(
+            Command::new("owns")
+                .short_flag('o')
+                .about("Shows which package owns a file.")
+                .arg(packages_arg("Path(s) to look up")),
+        )
+        .subcommand(
+            Command::new("files")
+                .about("Lists the files an installed package owns.")
+                .arg(packages_arg("Package(s) to list")),
         )
         .subcommand(
             Command::new("sync")
@@ -152,6 +210,8 @@ fn build_context(matches: &ArgMatches, sub: &ArgMatches) -> Result<Context, Stri
     let mut ctx = Context::load(&config_path, Ui::new()).map_err(|e| e.to_string())?;
     ctx.repo_only = matches.get_flag("repo-only");
     ctx.assume_yes = matches.get_flag("yes");
+    ctx.keep_cache = matches.get_flag("keep-cache");
+    ctx.auto_sync = !matches.get_flag("no-sync");
     ctx.dry_run = sub.try_get_one::<bool>("dry-run").ok().flatten().copied() == Some(true);
 
     if ctx.repo_only {
@@ -173,20 +233,68 @@ fn main() -> ExitCode {
             })
         }),
 
-        Some(("find", sub)) => build_context(&matches, sub).and_then(|ctx| {
+        Some(("find", sub)) => build_context(&matches, sub).and_then(|mut ctx| {
             let limit: usize = sub
                 .get_one::<String>("limit")
                 .and_then(|l| l.parse().ok())
                 .unwrap_or(20);
             let query = packages(sub).join(" ");
             let hits = ops::search::run(&ctx, &query)?;
+
             if hits.is_empty() {
                 ctx.ui.info(&format!("no packages match {query:?}"));
-            } else {
-                ops::search::print(&ctx, &hits, limit);
+                return Ok(());
+            }
+
+            // Offering the results as a numbered menu turns a search into an
+            // install without retyping a package name.
+            let selectable = ctx.ui.style.interactive && !ctx.assume_yes && !sub.get_flag("no-select");
+            ops::search::print_numbered(&ctx, &hits, limit, selectable);
+
+            if !selectable {
+                return Ok(());
+            }
+
+            let shown = hits.len().min(limit);
+            let answer = ctx
+                .ui
+                .prompt("install which? (e.g. 1 3, 2-4, ^2, blank to skip)");
+            let chosen = ops::search::parse_selection(&answer, shown);
+            if chosen.is_empty() {
+                return Ok(());
+            }
+
+            let targets: Vec<String> = chosen
+                .iter()
+                .map(|n| hits[n - 1].package.name.clone())
+                .collect();
+            ops::install::run(&mut ctx, &targets).map(|_| ())
+        }),
+
+        Some(("info", sub)) => {
+            build_context(&matches, sub).and_then(|ctx| ops::query::info(&ctx, &packages(sub)))
+        }
+
+        Some(("list", sub)) => build_context(&matches, sub).and_then(|ctx| {
+            let filter = rvn::ops::query::ListFilter {
+                orphans: sub.get_flag("orphans"),
+                foreign: sub.get_flag("foreign"),
+                explicit: sub.get_flag("explicit"),
+            };
+            let count = ops::query::list(&ctx, filter)?;
+            if count == 0 {
+                ctx.ui.info("nothing matches");
             }
             Ok(())
         }),
+
+        Some(("owns", sub)) => {
+            build_context(&matches, sub).and_then(|ctx| ops::query::owns(&ctx, &packages(sub)))
+        }
+
+        Some(("files", sub)) => {
+            build_context(&matches, sub).and_then(|ctx| ops::query::files(&ctx, &packages(sub)))
+        }
 
         Some(("sync", sub)) => build_context(&matches, sub).and_then(|mut ctx| {
             ctx.ui.banner(&format!("v{}", get_version()));
@@ -196,9 +304,11 @@ fn main() -> ExitCode {
         }),
 
         Some(("uninstall", sub)) => build_context(&matches, sub).and_then(|mut ctx| {
+            // Removing a package should not leave its dependencies behind,
+            // so orphan cleanup is the default rather than a flag to remember.
             let options = rvn::remove::Options {
                 cascade: sub.get_flag("cascade"),
-                recursive: sub.get_flag("recursive"),
+                recursive: !sub.get_flag("keep-orphans"),
                 nodeps: sub.get_flag("nodeps"),
             };
             ops::remove::run(&mut ctx, &packages(sub), options).map(|_| ())

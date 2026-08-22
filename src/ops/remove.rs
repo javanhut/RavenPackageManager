@@ -110,7 +110,21 @@ pub fn apply(ctx: &mut Context, plan: &RemovalPlan) -> Result<Outcome, String> {
 
     for pkg in &plan.remove {
         progress.set_detail(&pkg.name);
-        let files = remove::deletable_files(&ctx.local, pkg, &removing);
+
+        // Captured before the record is unregistered, and run before any file
+        // disappears so the hook can still use the package it belongs to.
+        let script = ctx.local.install_script(&pkg.name);
+        super::install::run_scriptlet(
+            ctx,
+            &pkg.name,
+            script.as_deref(),
+            crate::scriptlet::Hook::PreRemove,
+            &pkg.version,
+            None,
+        );
+
+        let files = remove::deletable_files(&ctx.local, pkg, &removing)
+            .map_err(|e| format!("{}: could not determine which files to delete: {e}", pkg.name))?;
 
         for file in &files {
             // Directory entries are pruned after every file is gone.
@@ -150,6 +164,20 @@ pub fn apply(ctx: &mut Context, plan: &RemovalPlan) -> Result<Outcome, String> {
         ctx.local
             .unregister(&pkg.name)
             .map_err(|e| format!("{}: could not update the local database: {e}", pkg.name))?;
+
+        super::install::run_scriptlet(
+            ctx,
+            &pkg.name,
+            script.as_deref(),
+            crate::scriptlet::Hook::PostRemove,
+            &pkg.version,
+            None,
+        );
+
+        // Upstream tracking outlives the package otherwise, leaving stale
+        // entries that would be consulted if it were ever reinstalled.
+        ctx.devel.forget(&pkg.name);
+
         removed.push(pkg.name.clone());
     }
 
@@ -158,6 +186,11 @@ pub fn apply(ctx: &mut Context, plan: &RemovalPlan) -> Result<Outcome, String> {
         removed.len(),
         if removed.len() == 1 { "" } else { "s" }
     ));
+
+    if let Err(e) = ctx.devel.save(&ctx.config.db_path) {
+        ctx.ui
+            .warn(&format!("could not update upstream tracking: {e}"));
+    }
 
     // ---- prune empty directories ---------------------------------------
     let spinner = ctx.ui.stage("pruning empty directories");

@@ -4,9 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bzip2 = "0.6.1"
 clap = "4.6.6"
+filetime = "0.2.29"
 flate2 = "1.1.9"
 hex = "0.4.3"
+liblzma = { version = "0.4.8", features = ["static"] }
 pgp = "0.20.0"
 ruzstd = "0.9.0"
 serde = { version = "1.0.229", features = ["derive"] }

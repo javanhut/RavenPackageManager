@@ -209,6 +209,26 @@ impl BackupFile {
     }
 }
 
+/// How thoroughly a package was checked before installation. Pacman records
+/// this as `%VALIDATION%`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Validation {
+    #[default]
+    None,
+    Sha256,
+    Pgp,
+}
+
+impl Validation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Validation::None => "none",
+            Validation::Sha256 => "sha256",
+            Validation::Pgp => "pgp",
+        }
+    }
+}
+
 /// A package as described by a sync database, the AUR, or the local database.
 #[derive(Debug, Clone, Default)]
 pub struct Package {
@@ -242,6 +262,14 @@ pub struct Package {
     pub backup: Vec<BackupFile>,
     /// Only meaningful for installed packages.
     pub install_reason: InstallReason,
+    /// The architecture the package was built for.
+    pub arch: Option<String>,
+    /// The `pkgbase` a split package was built from.
+    pub base: Option<String>,
+    /// Build timestamp, as seconds since the epoch.
+    pub build_date: u64,
+    /// How the package was verified at install time.
+    pub validation: Validation,
 }
 
 impl Default for Origin {

@@ -13,6 +13,14 @@ pub enum FetchError {
     AllMirrorsFailed { url: String, attempts: Vec<String> },
     Io(io::Error),
     Status { url: String, code: u16 },
+    /// The connection failed before any status was returned.
+    Transport { url: String, reason: String },
+    /// The server sent fewer bytes than it promised.
+    Truncated {
+        url: String,
+        expected: u64,
+        received: u64,
+    },
 }
 
 impl std::fmt::Display for FetchError {
@@ -27,6 +35,15 @@ impl std::fmt::Display for FetchError {
             }
             FetchError::Io(e) => write!(f, "{e}"),
             FetchError::Status { url, code } => write!(f, "{url} returned HTTP {code}"),
+            FetchError::Transport { url, reason } => write!(f, "{url}: {reason}"),
+            FetchError::Truncated {
+                url,
+                expected,
+                received,
+            } => write!(
+                f,
+                "{url} ended early: expected {expected} bytes, received {received}"
+            ),
         }
     }
 }
@@ -54,16 +71,25 @@ fn stream_to<W: Write>(
     sink: &mut W,
     mut on_bytes: impl FnMut(u64),
 ) -> Result<u64, FetchError> {
-    let mut response = agent
-        .get(url)
-        .call()
-        .map_err(|e| FetchError::Status {
+    // A refused connection and a 404 are different problems, and reporting a
+    // timeout as "HTTP 0" sends the reader looking in the wrong place.
+    let mut response = agent.get(url).call().map_err(|e| match &e {
+        ureq::Error::StatusCode(code) => FetchError::Status {
             url: url.to_string(),
-            code: match &e {
-                ureq::Error::StatusCode(code) => *code,
-                _ => 0,
-            },
-        })?;
+            code: *code,
+        },
+        other => FetchError::Transport {
+            url: url.to_string(),
+            reason: other.to_string(),
+        },
+    })?;
+
+    // Remembered before the body is consumed, so a short read is detectable.
+    let expected: Option<u64> = response
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok());
 
     let mut reader = response.body_mut().as_reader();
     let mut buffer = vec![0u8; 64 * 1024];
@@ -77,6 +103,18 @@ fn stream_to<W: Write>(
         sink.write_all(&buffer[..n])?;
         total += n as u64;
         on_bytes(n as u64);
+    }
+
+    // A connection that drops cleanly mid-transfer otherwise looks like a
+    // complete download, and the truncated file would be renamed into place.
+    if let Some(expected) = expected {
+        if total != expected {
+            return Err(FetchError::Truncated {
+                url: url.to_string(),
+                expected,
+                received: total,
+            });
+        }
     }
 
     Ok(total)
@@ -120,14 +158,25 @@ pub fn download_with_mirrors(
     let mut attempts = Vec::new();
     let mut progress = progress;
 
+    // A `.part` beside the target, named after it, so two concurrent
+    // downloads cannot tread on each other's temporary file.
+    let mut part = dest.as_os_str().to_os_string();
+    part.push(".part");
+    let part = std::path::PathBuf::from(part);
+
     for url in urls {
-        let part = dest.with_extension("part");
         let file = std::fs::File::create(&part)?;
         let mut writer = io::BufWriter::new(file);
 
+        // Bytes counted for a mirror that then fails have to be taken back,
+        // or a failover would push the bar past 100% and skew the rate.
+        let mut attempt_bytes = 0u64;
         let result = match progress.as_deref_mut() {
-            Some(p) => stream_to(&agent, url, &mut writer, |n| p.advance(n)),
-            None => stream_to(&agent, url, &mut writer, |_| {}),
+            Some(p) => stream_to(&agent, url, &mut writer, |n| {
+                attempt_bytes += n;
+                p.advance(n);
+            }),
+            None => stream_to(&agent, url, &mut writer, |n| attempt_bytes += n),
         };
 
         match result {
@@ -138,7 +187,11 @@ pub fn download_with_mirrors(
                 return Ok(total);
             }
             Err(e) => {
+                drop(writer);
                 let _ = std::fs::remove_file(&part);
+                if let Some(p) = progress.as_deref_mut() {
+                    p.rewind(attempt_bytes);
+                }
                 attempts.push(format!("{url}: {e}"));
             }
         }

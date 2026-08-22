@@ -103,6 +103,29 @@ impl Ui {
         }
     }
 
+    /// Asks for free-text input. Returns an empty string when there is no
+    /// terminal to ask.
+    pub fn prompt(&self, question: &str) -> String {
+        if !self.style.interactive {
+            return String::new();
+        }
+
+        let mut err = std::io::stderr();
+        let _ = write!(
+            err,
+            "  {}  {} ",
+            self.style.paint(Color::Violet, self.style.glyphs.bullet),
+            question
+        );
+        let _ = err.flush();
+
+        let mut answer = String::new();
+        if std::io::stdin().lock().read_line(&mut answer).is_err() {
+            return String::new();
+        }
+        answer.trim().to_string()
+    }
+
     /// Asks a yes/no question. Non-interactive sessions take `default`
     /// without blocking, so scripted use never hangs.
     pub fn confirm(&self, question: &str, default: bool) -> bool {

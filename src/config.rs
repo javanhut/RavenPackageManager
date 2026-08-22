@@ -98,7 +98,8 @@ impl Config {
         let mut arch_from_file: Option<Vec<String>> = None;
         // Section name -> raw key/value pairs, preserving repeats.
         let mut sections: Vec<(String, Vec<(String, String)>)> = Vec::new();
-        parse_into(path, &mut sections, 0)?;
+        let mut current = String::from("options");
+        parse_into(path, &mut sections, 0, &mut current)?;
 
         let mut global_siglevel = SigLevel::Required;
 
@@ -164,19 +165,6 @@ impl Config {
                 match key.as_str() {
                     "Server" => servers.push(expand(value, section, &primary_arch)),
                     "SigLevel" => siglevel = SigLevel::parse(value, siglevel),
-                    "Include" => {
-                        // Mirrorlists are plain `Server = ...` lists.
-                        if let Ok(text) = std::fs::read_to_string(value) {
-                            for line in text.lines() {
-                                let line = strip_comment(line);
-                                if let Some((k, v)) = split_kv(line) {
-                                    if k == "Server" {
-                                        servers.push(expand(&v, section, &primary_arch));
-                                    }
-                                }
-                            }
-                        }
-                    }
                     _ => {}
                 }
             }
@@ -210,18 +198,58 @@ fn split_kv(line: &str) -> Option<(String, String)> {
     Some((key.trim().to_string(), value.trim().to_string()))
 }
 
-/// Reads a config file into ordered sections, recursing through `Include`
-/// directives in the `[options]`/repo body.
+/// Expands an `Include` value, which pacman allows to be a glob.
+fn include_paths(pattern: &str) -> Vec<PathBuf> {
+    if !pattern.contains('*') {
+        return vec![PathBuf::from(pattern)];
+    }
+
+    let path = Path::new(pattern);
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return Vec::new();
+    };
+
+    // Only the common `dir/*.conf` shape is supported, which is what pacman
+    // configurations use in practice.
+    let (prefix, suffix) = match name.split_once('*') {
+        Some(parts) => parts,
+        None => return vec![path.to_path_buf()],
+    };
+
+    let mut matches: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with(prefix) && n.ends_with(suffix))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    // Directory order is arbitrary; sort so configuration is deterministic.
+    matches.sort();
+    matches
+}
+
+/// Reads a config file into ordered sections, following `Include` directives.
+///
+/// An `Include` is a textual splice at the point it appears, so an included
+/// file inherits the section it was included from — that is what makes a
+/// mirrorlist of bare `Server =` lines belong to the repository that included
+/// it — and may itself open new sections.
 fn parse_into(
     path: &Path,
     sections: &mut Vec<(String, Vec<(String, String)>)>,
     depth: usize,
+    current: &mut String,
 ) -> io::Result<()> {
     if depth > 10 {
         return Ok(()); // Guard against Include cycles.
     }
     let text = std::fs::read_to_string(path)?;
-    let mut current = String::from("options");
 
     for line in text.lines() {
         let line = strip_comment(line);
@@ -230,8 +258,8 @@ fn parse_into(
         }
 
         if line.starts_with('[') && line.ends_with(']') {
-            current = line[1..line.len() - 1].trim().to_string();
-            if !sections.iter().any(|(name, _)| *name == current) {
+            *current = line[1..line.len() - 1].trim().to_string();
+            if !sections.iter().any(|(name, _)| name == current) {
                 sections.push((current.clone(), Vec::new()));
             }
             continue;
@@ -243,12 +271,21 @@ fn parse_into(
             None => (line.to_string(), String::new()),
         };
 
-        if sections.iter().all(|(name, _)| *name != current) {
+        if key == "Include" {
+            for included in include_paths(&value) {
+                // A missing include is not fatal: pacman ships repository
+                // stanzas that reference mirrorlists which may not exist yet.
+                let _ = parse_into(&included, sections, depth + 1, current);
+            }
+            continue;
+        }
+
+        if sections.iter().all(|(name, _)| name != current) {
             sections.push((current.clone(), Vec::new()));
         }
         let entry = sections
             .iter_mut()
-            .find(|(name, _)| *name == current)
+            .find(|(name, _)| name == current)
             .expect("section was just ensured to exist");
         entry.1.push((key, value));
     }
@@ -315,6 +352,105 @@ mod tests {
         let custom = cfg.repo("custom").expect("custom repo");
         assert_eq!(custom.siglevel, SigLevel::Never);
         assert_eq!(custom.servers, vec!["file:///opt/repo"]);
+    }
+
+    #[test]
+    fn an_include_can_define_whole_repositories() {
+        // A user splitting repositories into a separate file must not have
+        // them silently disappear.
+        let extra = write_temp(
+            "extra-repos.conf",
+            "[myrepo]\nSigLevel = Never\nServer = https://my.host/$repo\n",
+        );
+        let conf = write_temp(
+            "with-included-repos.conf",
+            &format!("[options]\nArchitecture = x86_64\n\nInclude = {}\n", extra.display()),
+        );
+
+        let cfg = Config::load(&conf).unwrap();
+        let repo = cfg.repo("myrepo").expect("repo from the included file");
+        assert_eq!(repo.siglevel, SigLevel::Never);
+        assert_eq!(repo.servers, vec!["https://my.host/myrepo"]);
+    }
+
+    #[test]
+    fn an_include_inherits_the_including_section() {
+        // A mirrorlist is bare `Server =` lines; they belong to whichever
+        // repository included them.
+        let mirrors = write_temp("inherit-mirrors", "Server = https://a/$repo/os/$arch\n");
+        let conf = write_temp(
+            "inherit.conf",
+            &format!(
+                "[options]\nArchitecture = x86_64\n\n[core]\nInclude = {}\n[extra]\nInclude = {}\n",
+                mirrors.display(),
+                mirrors.display()
+            ),
+        );
+
+        let cfg = Config::load(&conf).unwrap();
+        // Each repository gets exactly one server, substituted for its name.
+        assert_eq!(
+            cfg.repo("core").unwrap().servers,
+            vec!["https://a/core/os/x86_64"]
+        );
+        assert_eq!(
+            cfg.repo("extra").unwrap().servers,
+            vec!["https://a/extra/os/x86_64"]
+        );
+    }
+
+    #[test]
+    fn included_files_are_not_read_twice() {
+        let mirrors = write_temp("dup-mirrors", "Server = https://a/$repo\n");
+        let conf = write_temp(
+            "dup.conf",
+            &format!("[options]\n\n[core]\nInclude = {}\n", mirrors.display()),
+        );
+        let cfg = Config::load(&conf).unwrap();
+        assert_eq!(cfg.repo("core").unwrap().servers.len(), 1, "no duplicates");
+    }
+
+    #[test]
+    fn an_include_cycle_terminates() {
+        let dir = std::env::temp_dir();
+        let a = dir.join("rvn-test-cycle-a.conf");
+        let b = dir.join("rvn-test-cycle-b.conf");
+        std::fs::write(&a, format!("[options]\nInclude = {}\n", b.display())).unwrap();
+        std::fs::write(&b, format!("Include = {}\n", a.display())).unwrap();
+
+        // Must return rather than recurse forever.
+        let cfg = Config::load(&a).unwrap();
+        assert!(cfg.repos.is_empty());
+    }
+
+    #[test]
+    fn a_missing_include_is_tolerated() {
+        let conf = write_temp(
+            "missing-include.conf",
+            "[options]\n\n[core]\nInclude = /nonexistent/mirrorlist\nServer = https://fallback/$repo\n",
+        );
+        // The repository must survive with the servers it does declare.
+        let cfg = Config::load(&conf).unwrap();
+        assert_eq!(cfg.repo("core").unwrap().servers, vec!["https://fallback/core"]);
+    }
+
+    #[test]
+    fn include_globs_expand_in_a_stable_order() {
+        let dir = std::env::temp_dir().join("rvn-test-glob");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("20-b.conf"), "[bee]\nServer = https://b\n").unwrap();
+        std::fs::write(dir.join("10-a.conf"), "[ay]\nServer = https://a\n").unwrap();
+        std::fs::write(dir.join("ignored.txt"), "[nope]\nServer = https://n\n").unwrap();
+
+        let conf = write_temp(
+            "glob.conf",
+            &format!("[options]\n\nInclude = {}/*.conf\n", dir.display()),
+        );
+        let cfg = Config::load(&conf).unwrap();
+
+        let names: Vec<&str> = cfg.repos.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["ay", "bee"], "sorted, and .txt excluded");
     }
 
     #[test]

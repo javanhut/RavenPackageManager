@@ -66,8 +66,19 @@ impl Progress {
     }
 
     /// Records absolute progress and repaints if enough time has passed.
+    ///
+    /// Overshoot is kept as-is rather than clamped: the displayed fraction is
+    /// bounded separately, and silently discarding the real count would hide
+    /// a caller reporting more work than it declared.
     pub fn set(&mut self, done: u64) {
-        self.done = done.min(self.total.max(done));
+        self.done = done;
+        self.maybe_paint();
+    }
+
+    /// Takes back progress that turned out not to count, such as bytes from a
+    /// mirror that failed partway through.
+    pub fn rewind(&mut self, delta: u64) {
+        self.done = self.done.saturating_sub(delta);
         self.maybe_paint();
     }
 
@@ -231,6 +242,21 @@ mod tests {
         let mut p = progress(1000);
         p.set(500);
         assert!(p.render().contains("/s"));
+    }
+
+    #[test]
+    fn rewinding_takes_back_failed_progress() {
+        let mut p = progress(1000);
+        p.advance(400);
+        assert_eq!(p.fraction(), 0.4);
+
+        // A mirror that failed after 400 bytes must not leave them counted.
+        p.rewind(400);
+        assert_eq!(p.fraction(), 0.0);
+
+        // Rewinding past zero must not underflow.
+        p.rewind(999_999);
+        assert_eq!(p.fraction(), 0.0);
     }
 
     #[test]

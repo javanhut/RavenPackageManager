@@ -35,29 +35,58 @@ impl SyncDb {
     }
 
     /// Parses a decompressed `.db` tar stream.
+    ///
+    /// Each package is a directory holding several members. `desc` carries the
+    /// metadata, but dependency information lives in a separate `depends`
+    /// member — reading only `desc` yields packages that appear to have no
+    /// dependencies at all. Fields from every member are merged.
     pub fn from_tar<R: Read>(repo: &str, reader: R) -> io::Result<SyncDb> {
         let mut archive = tar::Archive::new(reader);
-        let mut packages = Vec::new();
+        // Package directory -> merged fields, insertion-ordered so the result
+        // is stable across runs.
+        let mut records: Vec<(String, HashMap<String, Vec<String>>)> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
 
         for entry in archive.entries()? {
             let mut entry = entry?;
             let path = entry.path()?.to_path_buf();
 
-            // Only `desc` members carry the metadata we need; `files` and
-            // directory entries are skipped.
-            if path.file_name().and_then(|n| n.to_str()) != Some("desc") {
+            let member = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // `files` holds the file list, which is only needed by `rvn find
+            // --owns`; everything else describes the package.
+            if !matches!(member, "desc" | "depends") {
                 continue;
             }
+
+            let Some(dir) = path.parent().and_then(|p| p.to_str()).map(str::to_string) else {
+                continue;
+            };
 
             let mut text = String::new();
             if entry.read_to_string(&mut text).is_err() {
                 continue; // Non-UTF8 record: skip rather than abort the repo.
             }
 
-            if let Some(pkg) = desc::parse_package(&text, Origin::Repo(repo.to_string())) {
-                packages.push(pkg);
+            let fields = desc::parse_fields(&text);
+            match index.get(&dir) {
+                Some(&i) => {
+                    for (key, values) in fields {
+                        records[i].1.entry(key).or_default().extend(values);
+                    }
+                }
+                None => {
+                    index.insert(dir.clone(), records.len());
+                    records.push((dir, fields));
+                }
             }
         }
+
+        let packages: Vec<Package> = records
+            .into_iter()
+            .filter_map(|(_, fields)| {
+                desc::package_from_fields(&fields, Origin::Repo(repo.to_string()))
+            })
+            .collect();
 
         let mut db = SyncDb {
             repo: repo.to_string(),
@@ -149,6 +178,55 @@ mod tests {
         assert_eq!(db.get("go").unwrap().version, "1.22.0-1");
         assert_eq!(db.get("ripgrep").unwrap().origin.label(), "extra");
         assert!(db.get("nope").is_none());
+    }
+
+    #[test]
+    fn merges_the_separate_depends_member() {
+        // Arch databases split metadata across `desc` and `depends`; reading
+        // only `desc` would report every package as dependency-free.
+        let tar = fake_db(&[
+            (
+                "ripgrep-15.2.0-1/desc",
+                "%NAME%\nripgrep\n\n%VERSION%\n15.2.0-1\n",
+            ),
+            (
+                "ripgrep-15.2.0-1/depends",
+                "%DEPENDS%\nglibc\nlibgcc\npcre2\n\n%PROVIDES%\nrg=15.2.0\n",
+            ),
+            ("ripgrep-15.2.0-1/files", "%FILES%\nusr/bin/rg\n"),
+        ]);
+
+        let db = SyncDb::from_tar("extra", &tar[..]).unwrap();
+        assert_eq!(db.packages.len(), 1, "members must merge into one package");
+
+        let pkg = db.get("ripgrep").expect("ripgrep");
+        assert_eq!(pkg.version, "15.2.0-1");
+        assert_eq!(pkg.depends.len(), 3);
+        assert_eq!(pkg.depends[2].name, "pcre2");
+        assert_eq!(pkg.provides[0].to_string(), "rg=15.2.0");
+    }
+
+    #[test]
+    fn handles_depends_appearing_before_desc() {
+        // Tar member order is not guaranteed.
+        let tar = fake_db(&[
+            ("app-1.0-1/depends", "%DEPENDS%\nglibc\n"),
+            ("app-1.0-1/desc", "%NAME%\napp\n\n%VERSION%\n1.0-1\n"),
+        ]);
+        let db = SyncDb::from_tar("core", &tar[..]).unwrap();
+        assert_eq!(db.packages.len(), 1);
+        assert_eq!(db.get("app").unwrap().depends[0].name, "glibc");
+    }
+
+    #[test]
+    fn inline_depends_still_work() {
+        // Some repositories merge everything into `desc`.
+        let tar = fake_db(&[(
+            "app-1.0-1/desc",
+            "%NAME%\napp\n\n%VERSION%\n1.0-1\n\n%DEPENDS%\nglibc\n",
+        )]);
+        let db = SyncDb::from_tar("core", &tar[..]).unwrap();
+        assert_eq!(db.get("app").unwrap().depends[0].name, "glibc");
     }
 
     #[test]

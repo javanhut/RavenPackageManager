@@ -5,7 +5,10 @@
 //! That keeps a conflicting package from leaving a half-installed mess.
 
 use crate::db::local::LocalDb;
+use bzip2::read::BzDecoder;
+use filetime::FileTime;
 use flate2::read::GzDecoder;
+use liblzma::read::XzDecoder;
 use ruzstd::decoding::StreamingDecoder;
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -72,17 +75,23 @@ fn open_archive(path: &Path) -> Result<Box<dyn Read>, ExtractError> {
     let reader = io::BufReader::new(file);
     let name = path.to_string_lossy();
 
+    // Arch has moved to zstd, but xz is still what Arch Linux ARM ships and
+    // what older packages in every repository use.
     if name.ends_with(".zst") || name.ends_with(".zstd") {
         let decoder = StreamingDecoder::new(reader)
             .map_err(|e| ExtractError::UnsupportedFormat(e.to_string()))?;
         Ok(Box::new(decoder))
+    } else if name.ends_with(".xz") || name.ends_with(".lzma") {
+        Ok(Box::new(XzDecoder::new(reader)))
     } else if name.ends_with(".gz") {
         Ok(Box::new(GzDecoder::new(reader)))
+    } else if name.ends_with(".bz2") {
+        Ok(Box::new(BzDecoder::new(reader)))
     } else if name.ends_with(".tar") {
         Ok(Box::new(reader))
     } else {
         Err(ExtractError::UnsupportedFormat(format!(
-            "{name}: expected .pkg.tar.zst, .tar.gz or .tar"
+            "{name}: expected .pkg.tar.zst, .xz, .gz, .bz2 or .tar"
         )))
     }
 }
@@ -134,24 +143,57 @@ pub struct Manifest {
     pub directories: Vec<String>,
     /// Whether the package ships an `.INSTALL` scriptlet.
     pub has_install_script: bool,
+    /// The scriptlet itself, kept so its hooks can run and so it can be stored
+    /// for later removal hooks.
+    pub install_script: Option<Vec<u8>>,
+    /// The scriptlet's timestamp in the archive. pacman preserves it when
+    /// storing the file, and `pacman -Qkk` checks it against the `.MTREE`.
+    pub install_script_mtime: Option<u64>,
     pub total_size: u64,
     /// Configuration files listed as `backup` in `.PKGINFO`, which must be
     /// preserved rather than deleted on removal.
     pub backup: Vec<String>,
+    /// The raw `.MTREE`, stored verbatim in the local database so `pacman
+    /// -Qkk` can verify the package.
+    pub mtree: Option<Vec<u8>>,
+    /// Dependencies declared in `.PKGINFO`, which is authoritative when a
+    /// sync database entry is incomplete.
+    pub depends: Vec<String>,
+    /// Every `.PKGINFO` field. For a package rvn built itself this is the only
+    /// source of metadata — the AUR RPC supplies neither size nor architecture.
+    pub pkginfo: HashMap<String, Vec<String>>,
 }
 
-/// Pulls `backup = path` entries out of a `.PKGINFO` body.
+/// Parses a `.PKGINFO` body into key -> values.
 ///
-/// The format is plain `key = value` lines with `#` comments.
-pub fn parse_pkginfo_backup(text: &str) -> Vec<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with('#'))
-        .filter_map(|line| line.split_once('='))
-        .filter(|(key, _)| key.trim() == "backup")
-        .map(|(_, value)| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect()
+/// The format is plain `key = value` lines with `#` comments; keys repeat for
+/// list-valued fields such as `depend` and `backup`.
+pub fn parse_pkginfo(text: &str) -> HashMap<String, Vec<String>> {
+    let mut fields: HashMap<String, Vec<String>> = HashMap::new();
+
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        fields
+            .entry(key.trim().to_string())
+            .or_default()
+            .push(value.to_string());
+    }
+
+    fields
+}
+
+/// Pulls one repeated field out of a `.PKGINFO` body.
+pub fn parse_pkginfo_field(text: &str, key: &str) -> Vec<String> {
+    parse_pkginfo(text).remove(key).unwrap_or_default()
 }
 
 /// Reads an archive's table of contents.
@@ -165,12 +207,38 @@ pub fn manifest(path: &Path) -> Result<Manifest, ExtractError> {
 
         if is_metadata(&entry_path) {
             match entry_path.to_str() {
-                Some(".INSTALL") => manifest.has_install_script = true,
+                Some(".INSTALL") => {
+                    manifest.has_install_script = true;
+                    let mtime = entry.header().mtime().ok();
+                    let mut bytes = Vec::new();
+                    let mut entry = entry;
+                    if entry.read_to_end(&mut bytes).is_ok() {
+                        manifest.install_script = Some(bytes);
+                        manifest.install_script_mtime = mtime;
+                    }
+                }
                 Some(".PKGINFO") => {
                     let mut text = String::new();
                     let mut entry = entry;
                     if entry.read_to_string(&mut text).is_ok() {
-                        manifest.backup = parse_pkginfo_backup(&text);
+                        manifest.pkginfo = parse_pkginfo(&text);
+                        manifest.backup = manifest
+                            .pkginfo
+                            .get("backup")
+                            .cloned()
+                            .unwrap_or_default();
+                        manifest.depends = manifest
+                            .pkginfo
+                            .get("depend")
+                            .cloned()
+                            .unwrap_or_default();
+                    }
+                }
+                Some(".MTREE") => {
+                    let mut bytes = Vec::new();
+                    let mut entry = entry;
+                    if entry.read_to_end(&mut bytes).is_ok() {
+                        manifest.mtree = Some(bytes);
                     }
                 }
                 _ => {}
@@ -200,21 +268,22 @@ pub fn find_conflicts(
     manifest: &Manifest,
     local: &LocalDb,
     upgrading: Option<&str>,
-) -> Vec<ExtractError> {
+) -> Result<Vec<ExtractError>, ExtractError> {
     // Build an owner index once rather than rescanning per file.
     let mut owners: HashMap<String, String> = HashMap::new();
     for name in local.packages.keys() {
         if Some(name.as_str()) == upgrading {
             continue;
         }
-        if let Ok(files) = local.files(name) {
-            for file in files {
-                owners.insert(file, name.clone());
-            }
+        // An unreadable file list must not be skipped: doing so would leave
+        // that package's files looking unowned, and the conflict they
+        // represent would go unreported right before they are overwritten.
+        for file in local.files_or_empty(name)? {
+            owners.insert(file, name.clone());
         }
     }
 
-    manifest
+    Ok(manifest
         .files
         .iter()
         .filter_map(|file| {
@@ -223,7 +292,7 @@ pub fn find_conflicts(
                 owner: owner.clone(),
             })
         })
-        .collect()
+        .collect())
 }
 
 /// Unpacks an archive into `root`, returning the installed file list.
@@ -241,6 +310,10 @@ pub fn unpack(
     let mut installed = Vec::new();
     // (link path, target path), both root-relative.
     let mut deferred_links: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // Symlink and directory timestamps, applied at the end. `Entry::unpack`
+    // restores mtime for regular files, but not for these — and pacman's
+    // `-Qkk` reports the difference as an altered file.
+    let mut deferred_times: Vec<(PathBuf, u64, bool)> = Vec::new();
 
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -261,6 +334,7 @@ pub fn unpack(
 
         if kind.is_dir() {
             std::fs::create_dir_all(&destination)?;
+            deferred_times.push((destination.clone(), entry.header().mtime().unwrap_or(0), true));
             // Recorded with a trailing slash, as pacman does, so removal can
             // prune directories a package created but never filled.
             installed.push(format!("{}/", relative.to_string_lossy()));
@@ -291,6 +365,11 @@ pub fn unpack(
                 // the installed root.
                 let _ = std::fs::remove_file(&destination);
                 std::os::unix::fs::symlink(&target, &destination)?;
+                deferred_times.push((
+                    destination.clone(),
+                    entry.header().mtime().unwrap_or(0),
+                    false,
+                ));
             }
         } else {
             entry.unpack(&destination)?;
@@ -336,7 +415,34 @@ pub fn unpack(
         installed.push(as_string);
     }
 
+    apply_timestamps(deferred_times);
+
     Ok(installed)
+}
+
+/// Restores mtimes on symlinks and directories.
+///
+/// Directories are done deepest-first: writing a child updates its parent's
+/// mtime, so parents must be stamped after everything inside them.
+fn apply_timestamps(mut entries: Vec<(PathBuf, u64, bool)>) {
+    entries.sort_by_key(|(path, _, is_dir)| {
+        // Symlinks first, then directories from the deepest upward.
+        (*is_dir, std::cmp::Reverse(path.components().count()))
+    });
+
+    for (path, mtime, is_dir) in entries {
+        if mtime == 0 {
+            continue;
+        }
+        let stamp = FileTime::from_unix_time(mtime as i64, 0);
+        // Symlinks must be stamped without following them, or the target's
+        // timestamp is changed instead.
+        let _ = if is_dir {
+            filetime::set_file_times(&path, stamp, stamp)
+        } else {
+            filetime::set_symlink_file_times(&path, stamp, stamp)
+        };
+    }
 }
 
 #[cfg(test)]
@@ -393,6 +499,10 @@ mod tests {
         assert!(m.files.contains(&"usr/share/doc/demo/README".to_string()));
         // Metadata members are recorded but never installed.
         assert!(m.has_install_script);
+        assert_eq!(
+            m.install_script.as_deref(),
+            Some(&b"post_install() { :; }"[..])
+        );
         assert!(!m.files.iter().any(|f| f.starts_with('.')));
         assert_eq!(m.directories, vec!["usr/"]);
         assert!(m.total_size > 0);
@@ -535,6 +645,48 @@ mod tests {
     }
 
     #[test]
+    fn restores_symlink_and_directory_timestamps() {
+        const STAMP: u64 = 1_700_000_000;
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut dir_header = tar::Header::new_gnu();
+        dir_header.set_entry_type(tar::EntryType::Directory);
+        dir_header.set_size(0);
+        dir_header.set_mode(0o755);
+        dir_header.set_mtime(STAMP);
+        dir_header.set_cksum();
+        builder.append_data(&mut dir_header, "usr/lib/", &[][..]).unwrap();
+
+        let mut link_header = tar::Header::new_gnu();
+        link_header.set_entry_type(tar::EntryType::Symlink);
+        link_header.set_size(0);
+        link_header.set_mode(0o777);
+        link_header.set_mtime(STAMP);
+        link_header.set_link_name("libfoo.so.1").unwrap();
+        link_header.set_cksum();
+        builder
+            .append_data(&mut link_header, "usr/lib/libfoo.so", &[][..])
+            .unwrap();
+
+        let archive = write_tar("mtime", &builder.into_inner().unwrap());
+        let root = temp_dir("mtime");
+        unpack(&archive, &root, |_| {}).unwrap();
+
+        // The symlink's own timestamp, not its target's.
+        let link_meta = std::fs::symlink_metadata(root.join("usr/lib/libfoo.so")).unwrap();
+        assert_eq!(
+            FileTime::from_last_modification_time(&link_meta).unix_seconds(),
+            STAMP as i64
+        );
+
+        let dir_meta = std::fs::metadata(root.join("usr/lib")).unwrap();
+        assert_eq!(
+            FileTime::from_last_modification_time(&dir_meta).unix_seconds(),
+            STAMP as i64
+        );
+    }
+
+    #[test]
     fn recreates_symlinks_verbatim() {
         let mut builder = tar::Builder::new(Vec::new());
         link_entry(
@@ -605,16 +757,59 @@ mod tests {
 
         let m = manifest(&path).unwrap();
         assert_eq!(m.backup, vec!["etc/demo.conf", "etc/demo.d/extra.conf"]);
+        // .PKGINFO is authoritative for dependencies.
+        assert_eq!(m.depends, vec!["glibc"]);
         // .PKGINFO itself is still never installed.
         assert_eq!(m.files, vec!["etc/demo.conf"]);
     }
 
     #[test]
     fn pkginfo_without_backup_entries_yields_none() {
-        let entries = parse_pkginfo_backup("pkgname = demo\ndepend = glibc\n");
+        let entries = parse_pkginfo_field("pkgname = demo\ndepend = glibc\n", "backup");
         assert!(entries.is_empty());
         // Comments and blank lines must not confuse the parser.
-        assert!(parse_pkginfo_backup("# backup = fake\n\n").is_empty());
+        assert!(parse_pkginfo_field("# backup = fake\n\n", "backup").is_empty());
+    }
+
+    #[test]
+    fn pkginfo_fields_are_all_captured() {
+        let pkginfo = "pkgname = demo\n\
+                       pkgver = 1.2.3-1\n\
+                       pkgdesc = A demo package\n\
+                       url = https://example.com\n\
+                       builddate = 1700000000\n\
+                       packager = Someone <a@b.c>\n\
+                       size = 123456\n\
+                       arch = any\n\
+                       license = MIT\n\
+                       depend = glibc\n\
+                       depend = pcre2\n";
+        let tar = build_tar(&[
+            (".PKGINFO", pkginfo, false),
+            ("usr/bin/demo", "x", false),
+        ]);
+        let path = write_tar("pkginfo-full", &tar);
+        let m = manifest(&path).unwrap();
+
+        assert_eq!(m.pkginfo.get("size").unwrap(), &["123456"]);
+        assert_eq!(m.pkginfo.get("arch").unwrap(), &["any"]);
+        assert_eq!(m.pkginfo.get("pkgver").unwrap(), &["1.2.3-1"]);
+        assert_eq!(m.pkginfo.get("depend").unwrap().len(), 2);
+        // The convenience views stay in agreement with the map.
+        assert_eq!(m.depends, vec!["glibc", "pcre2"]);
+    }
+
+    #[test]
+    fn mtree_is_captured_for_the_local_database() {
+        let tar = build_tar(&[
+            (".MTREE", "#mtree binary-ish payload", false),
+            ("usr/bin/demo", "x", false),
+        ]);
+        let path = write_tar("mtree", &tar);
+        let m = manifest(&path).unwrap();
+        assert_eq!(m.mtree.as_deref(), Some(&b"#mtree binary-ish payload"[..]));
+        // It must not be installed onto the filesystem.
+        assert_eq!(m.files, vec!["usr/bin/demo"]);
     }
 
     #[test]
@@ -637,6 +832,53 @@ mod tests {
         let m = manifest(&archive).unwrap();
         assert_eq!(m.files, vec!["usr/bin/demo"]);
         assert_eq!(m.directories, vec!["usr/", "usr/bin/"]);
+    }
+
+    /// Compresses a tar with the given external-format writer and returns the
+    /// path, so each supported container is exercised end to end.
+    fn write_compressed(tag: &str, ext: &str, tar: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("rvn-extract-{tag}.tar.{ext}"));
+        let out = std::fs::File::create(&path).unwrap();
+        match ext {
+            "xz" => {
+                let mut enc = liblzma::write::XzEncoder::new(out, 1);
+                std::io::Write::write_all(&mut enc, tar).unwrap();
+                enc.finish().unwrap();
+            }
+            "gz" => {
+                let mut enc =
+                    flate2::write::GzEncoder::new(out, flate2::Compression::fast());
+                std::io::Write::write_all(&mut enc, tar).unwrap();
+                enc.finish().unwrap();
+            }
+            "bz2" => {
+                let mut enc = bzip2::write::BzEncoder::new(out, bzip2::Compression::fast());
+                std::io::Write::write_all(&mut enc, tar).unwrap();
+                enc.finish().unwrap();
+            }
+            other => panic!("unhandled format {other}"),
+        }
+        path
+    }
+
+    #[test]
+    fn reads_every_supported_container_format() {
+        let tar = build_tar(&[
+            (".PKGINFO", "pkgname = demo", false),
+            ("usr/bin/demo", "#!/bin/sh\n", false),
+        ]);
+
+        for ext in ["xz", "gz", "bz2"] {
+            let path = write_compressed(&format!("fmt-{ext}"), ext, &tar);
+            let m = manifest(&path)
+                .unwrap_or_else(|e| panic!("{ext} manifest failed: {e}"));
+            assert_eq!(m.files, vec!["usr/bin/demo"], "format {ext}");
+
+            let root = temp_dir(&format!("fmt-{ext}"));
+            let files = unpack(&path, &root, |_| {}).unwrap();
+            assert_eq!(files, vec!["usr/bin/demo"], "format {ext}");
+            assert!(root.join("usr/bin/demo").exists(), "format {ext}");
+        }
     }
 
     #[test]
@@ -666,12 +908,12 @@ mod tests {
             ..Default::default()
         };
 
-        let conflicts = find_conflicts(&manifest, &local, None);
+        let conflicts = find_conflicts(&manifest, &local, None).unwrap();
         assert_eq!(conflicts.len(), 1);
         assert!(conflicts[0].to_string().contains("owned by other"));
 
         // Upgrading the owning package is not a conflict with itself.
-        let none = find_conflicts(&manifest, &local, Some("other"));
+        let none = find_conflicts(&manifest, &local, Some("other")).unwrap();
         assert!(none.is_empty());
     }
 }

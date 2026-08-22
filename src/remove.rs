@@ -223,23 +223,24 @@ pub fn deletable_files(
     local: &LocalDb,
     pkg: &Package,
     also_removing: &HashSet<String>,
-) -> Vec<String> {
-    let own_files = local.files(&pkg.name).unwrap_or_default();
+) -> std::io::Result<Vec<String>> {
+    let own_files = local.files_or_empty(&pkg.name)?;
 
     let mut kept: HashSet<String> = HashSet::new();
     for other in local.packages.values() {
         if other.name == pkg.name || also_removing.contains(&other.name) {
             continue;
         }
-        if let Ok(files) = local.files(&other.name) {
-            kept.extend(files);
-        }
+        // An unreadable file list must abort the removal. Skipping it would
+        // leave that package's files looking unowned, and they would be
+        // deleted along with the target's.
+        kept.extend(local.files_or_empty(&other.name)?);
     }
 
-    own_files
+    Ok(own_files
         .into_iter()
         .filter(|file| !kept.contains(file))
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -447,6 +448,20 @@ mod tests {
     }
 
     #[test]
+    fn a_package_without_a_file_list_owns_nothing() {
+        let root = temp_root("no-files");
+        let mut local = LocalDb::load(&root);
+        let meta = pkg("meta", &[], InstallReason::Explicit);
+        local.register(&meta, &[]).unwrap();
+        // Remove the record entirely, as a metapackage may have none.
+        let _ = std::fs::remove_file(root.join("meta-1.0-1/files"));
+
+        // Missing means "owns nothing", not an error.
+        let files = deletable_files(&local, &meta, &HashSet::new()).unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
     fn shared_files_are_not_deleted() {
         let root = temp_root("shared");
         let mut local = LocalDb::load(&root);
@@ -461,12 +476,12 @@ mod tests {
             .unwrap();
 
         // Removing only `a` must leave the file `b` also owns.
-        let files = deletable_files(&local, &a, &HashSet::new());
+        let files = deletable_files(&local, &a, &HashSet::new()).unwrap();
         assert_eq!(files, vec!["usr/bin/a"]);
 
         // Removing both frees the shared file.
         let both: HashSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
-        let files = deletable_files(&local, &a, &both);
+        let files = deletable_files(&local, &a, &both).unwrap();
         assert!(files.contains(&"usr/share/common".to_string()));
     }
 }

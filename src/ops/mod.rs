@@ -1,6 +1,7 @@
 //! High-level operations, each owning one user-facing command.
 
 pub mod install;
+pub mod query;
 pub mod remove;
 pub mod search;
 pub mod sync;
@@ -28,6 +29,14 @@ pub struct Context {
     pub dry_run: bool,
     /// Answer every prompt affirmatively.
     pub assume_yes: bool,
+    /// Keep downloaded packages after a successful transaction.
+    pub keep_cache: bool,
+    /// Refresh stale or missing databases without being asked.
+    pub auto_sync: bool,
+    /// Upstream commits of the VCS packages rvn has built.
+    pub devel: crate::devel::Registry,
+    /// Packages to reinstall even if their version already matches.
+    pub force_rebuild: Vec<String>,
 }
 
 impl Context {
@@ -35,7 +44,24 @@ impl Context {
     /// already exist. Missing databases are not an error — the caller can
     /// refresh them.
     pub fn load(config_path: &PathBuf, ui: Ui) -> std::io::Result<Context> {
-        let config = Config::load(config_path).unwrap_or_default();
+        // A mistyped --config must not silently fall back to defaults that
+        // point at the real system databases.
+        let config = match Config::load(config_path) {
+            Ok(config) => config,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{}: no such configuration file", config_path.display()),
+                ));
+            }
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("{}: {e}", config_path.display()),
+                ));
+            }
+        };
+        let db_path_for_devel = config.db_path.clone();
         let local = LocalDb::load(&config.local_db_path());
         let (sync, _missing) = crate::db::sync::load_all(&config);
         let keyring = Keyring::load(&config.gpg_dir).ok();
@@ -50,6 +76,10 @@ impl Context {
             repo_only: false,
             dry_run: false,
             assume_yes: false,
+            keep_cache: false,
+            auto_sync: true,
+            devel: crate::devel::Registry::load(&db_path_for_devel),
+            force_rebuild: Vec::new(),
         })
     }
 

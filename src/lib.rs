@@ -1,6 +1,7 @@
 pub mod aur;
 pub mod config;
 pub mod db;
+pub mod devel;
 pub mod extract;
 pub mod fetch;
 pub mod ops;
@@ -8,6 +9,7 @@ pub mod pkg;
 pub mod remove;
 pub mod resolve;
 pub mod ui;
+pub mod scriptlet;
 pub mod upgrade;
 pub mod verify;
 pub mod version;

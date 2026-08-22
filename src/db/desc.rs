@@ -4,7 +4,7 @@
 //! A record is a sequence of `%KEY%` headers, each followed by one or more
 //! value lines and terminated by a blank line.
 
-use crate::pkg::{BackupFile, Dep, InstallReason, Origin, Package};
+use crate::pkg::{BackupFile, Dep, InstallReason, Origin, Package, Validation};
 use std::collections::HashMap;
 
 /// Splits a desc blob into key -> values.
@@ -66,7 +66,13 @@ pub fn package_from_fields(fields: &HashMap<String, Vec<String>>, origin: Origin
         replaces: deps(fields, "REPLACES"),
         filename: one(fields, "FILENAME"),
         csize: num(fields, "CSIZE"),
-        isize: num(fields, "ISIZE"),
+        // Sync databases call the installed size ISIZE; the local database
+        // calls the same value SIZE.
+        isize: if fields.contains_key("ISIZE") {
+            num(fields, "ISIZE")
+        } else {
+            num(fields, "SIZE")
+        },
         sha256: one(fields, "SHA256SUM"),
         has_sig: fields.contains_key("PGPSIG"),
         origin,
@@ -80,6 +86,14 @@ pub fn package_from_fields(fields: &HashMap<String, Vec<String>>, origin: Origin
         install_reason: one(fields, "REASON")
             .map(|r| InstallReason::from_code(&r))
             .unwrap_or_default(),
+        arch: one(fields, "ARCH"),
+        base: one(fields, "BASE"),
+        build_date: num(fields, "BUILDDATE"),
+        validation: match one(fields, "VALIDATION").as_deref() {
+            Some("pgp") => Validation::Pgp,
+            Some("sha256") => Validation::Sha256,
+            _ => Validation::None,
+        },
     })
 }
 
@@ -172,6 +186,24 @@ go-compiler=1.22.0
         assert_eq!(pkg.backup[0].hash.as_deref(), Some("9a8b7c"));
         assert_eq!(pkg.backup[1].path, "etc/bar.conf");
         assert!(pkg.backup[1].hash.is_none());
+    }
+
+    #[test]
+    fn local_database_size_field_is_understood() {
+        // The local database writes SIZE where a sync database writes ISIZE.
+        let pkg = parse_package("%NAME%\nfoo\n\n%SIZE%\n4096\n", Origin::Local).unwrap();
+        assert_eq!(pkg.isize, 4096);
+    }
+
+    #[test]
+    fn parses_arch_base_and_validation() {
+        let text = "%NAME%\nfoo\n\n%ARCH%\naarch64\n\n%BASE%\nfoo-git\n\n\
+                    %BUILDDATE%\n1700000000\n\n%VALIDATION%\npgp\n";
+        let pkg = parse_package(text, Origin::Local).unwrap();
+        assert_eq!(pkg.arch.as_deref(), Some("aarch64"));
+        assert_eq!(pkg.base.as_deref(), Some("foo-git"));
+        assert_eq!(pkg.build_date, 1_700_000_000);
+        assert_eq!(pkg.validation, Validation::Pgp);
     }
 
     #[test]

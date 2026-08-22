@@ -78,6 +78,10 @@ pub struct Plan {
     pub conflicts: Vec<Conflict>,
     /// Dependency cycles that had to be broken, for reporting.
     pub cycles: Vec<Vec<String>>,
+    /// Installed packages that an incoming package explicitly replaces, as
+    /// (successor, replaced). These are retired rather than treated as
+    /// conflicts, which is how a package rename is meant to work.
+    pub replacing: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +118,10 @@ pub struct Resolver<'a> {
     aur: &'a dyn Source,
     /// Skip these when resolving, per `IgnorePkg`.
     ignore: HashSet<String>,
+    /// Rebuild these even when the installed version already satisfies the
+    /// request. A VCS package's version does not change when upstream moves,
+    /// so nothing else would ever schedule it.
+    force: HashSet<String>,
 }
 
 impl<'a> Resolver<'a> {
@@ -123,11 +131,18 @@ impl<'a> Resolver<'a> {
             local,
             aur,
             ignore: HashSet::new(),
+            force: HashSet::new(),
         }
     }
 
     pub fn ignoring(mut self, names: &[String]) -> Self {
         self.ignore = names.iter().cloned().collect();
+        self
+    }
+
+    /// Marks targets that must be reinstalled regardless of version.
+    pub fn forcing(mut self, names: &[String]) -> Self {
+        self.force = names.iter().cloned().collect();
         self
     }
 
@@ -188,6 +203,7 @@ impl<'a> Resolver<'a> {
             if let Some(installed) = self.local.get(&dep.name) {
                 if dep.satisfied_by(&installed.version)
                     && self.upgrade_candidate(&dep.name).is_none()
+                    && !self.force.contains(&dep.name)
                 {
                     plan.already_satisfied.push(dep.name.clone());
                     continue;
@@ -304,10 +320,40 @@ impl<'a> Resolver<'a> {
         let incoming: Vec<&Package> = plan.install.iter().map(|r| &r.package).collect();
 
         for pkg in &incoming {
+            for replaces in &pkg.replaces {
+                let Some(installed) = self.local.satisfier(replaces) else {
+                    continue;
+                };
+                if installed.name == pkg.name || incoming.iter().any(|p| p.name == installed.name) {
+                    continue;
+                }
+                let entry = (pkg.name.clone(), installed.name.clone());
+                if !plan.replacing.contains(&entry) {
+                    plan.replacing.push(entry);
+                }
+            }
+
             for conflict in &pkg.conflicts {
                 // Self-conflicts via provides are normal and not reported.
                 if conflict.name == pkg.name {
                     continue;
+                }
+
+                // Declaring both `conflicts` and `replaces` for the same
+                // package is how a rename is expressed. Treating it as a
+                // conflict would block every renamed package.
+                if let Some(installed) = self.local.satisfier(conflict) {
+                    let is_replacement = pkg
+                        .replaces
+                        .iter()
+                        .any(|r| installed.satisfies(r));
+                    if is_replacement && !incoming.iter().any(|p| p.name == installed.name) {
+                        let entry = (pkg.name.clone(), installed.name.clone());
+                        if !plan.replacing.contains(&entry) {
+                            plan.replacing.push(entry);
+                        }
+                        continue;
+                    }
                 }
 
                 if let Some(other) = incoming.iter().find(|p| p.satisfies(conflict)) {
@@ -372,6 +418,13 @@ mod tests {
             if !p.conflicts.is_empty() {
                 body.push_str("%CONFLICTS%\n");
                 for d in &p.conflicts {
+                    body.push_str(&format!("{d}\n"));
+                }
+                body.push('\n');
+            }
+            if !p.replaces.is_empty() {
+                body.push_str("%REPLACES%\n");
+                for d in &p.replaces {
                     body.push_str(&format!("{d}\n"));
                 }
                 body.push('\n');
@@ -441,6 +494,25 @@ mod tests {
     }
 
     #[test]
+    fn forced_targets_are_reinstalled_at_the_same_version() {
+        let dbs = sync_db(vec![pkg("app", "1.0-1", &[])]);
+        let mut local = empty_local();
+        local.packages.insert("app".into(), pkg("app", "1.0-1", &[]));
+
+        // Without forcing, an identical version is left alone.
+        let plan = Resolver::new(&dbs, &local, &NoSource).resolve(&["app".into()]);
+        assert!(plan.install.is_empty());
+
+        // A VCS package's version never moves, so a rebuild has to be forced
+        // or it would silently do nothing.
+        let plan = Resolver::new(&dbs, &local, &NoSource)
+            .forcing(&["app".to_string()])
+            .resolve(&["app".into()]);
+        assert_eq!(names(&plan), vec!["app"]);
+        assert!(plan.already_satisfied.is_empty());
+    }
+
+    #[test]
     fn newer_sync_version_is_an_upgrade() {
         let dbs = sync_db(vec![pkg("app", "2.0-1", &[])]);
         let mut local = empty_local();
@@ -506,6 +578,68 @@ mod tests {
         assert_eq!(plan.conflicts.len(), 1);
         assert_eq!(plan.conflicts[0].package, "nginx");
         assert_eq!(plan.conflicts[0].conflicts_with, "apache");
+    }
+
+    #[test]
+    fn a_declared_replacement_is_not_a_conflict() {
+        // The standard rename shape: the successor both conflicts with and
+        // replaces the package it supersedes.
+        let mut successor = pkg("newname", "2.0-1", &[]);
+        successor.conflicts = vec![Dep::parse("oldname")];
+        successor.replaces = vec![Dep::parse("oldname")];
+
+        let dbs = sync_db(vec![successor]);
+        let mut local = empty_local();
+        local
+            .packages
+            .insert("oldname".into(), pkg("oldname", "1.0-1", &[]));
+
+        let plan = Resolver::new(&dbs, &local, &NoSource).resolve(&["newname".into()]);
+
+        assert!(
+            plan.conflicts.is_empty(),
+            "a rename must not be blocked: {:?}",
+            plan.conflicts
+        );
+        assert_eq!(names(&plan), vec!["newname"]);
+        assert_eq!(
+            plan.replacing,
+            vec![("newname".to_string(), "oldname".to_string())]
+        );
+    }
+
+    #[test]
+    fn replacing_is_recorded_without_a_conflict_declaration() {
+        let mut successor = pkg("newname", "2.0-1", &[]);
+        successor.replaces = vec![Dep::parse("oldname")];
+
+        let dbs = sync_db(vec![successor]);
+        let mut local = empty_local();
+        local
+            .packages
+            .insert("oldname".into(), pkg("oldname", "1.0-1", &[]));
+
+        let plan = Resolver::new(&dbs, &local, &NoSource).resolve(&["newname".into()]);
+        assert_eq!(
+            plan.replacing,
+            vec![("newname".to_string(), "oldname".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_genuine_conflict_is_still_reported() {
+        // Conflicting without replacing is a real conflict.
+        let mut a = pkg("nginx", "1.0-1", &[]);
+        a.conflicts = vec![Dep::parse("apache")];
+        let dbs = sync_db(vec![a]);
+        let mut local = empty_local();
+        local
+            .packages
+            .insert("apache".into(), pkg("apache", "2.4-1", &[]));
+
+        let plan = Resolver::new(&dbs, &local, &NoSource).resolve(&["nginx".into()]);
+        assert_eq!(plan.conflicts.len(), 1);
+        assert!(plan.replacing.is_empty());
     }
 
     #[test]

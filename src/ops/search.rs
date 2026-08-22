@@ -104,9 +104,14 @@ fn make_hit(ctx: &Context, package: Package, _query: &str) -> Hit {
 
 /// Prints search results to stdout, so they stay pipeable.
 pub fn print(ctx: &Context, hits: &[Hit], limit: usize) {
+    print_numbered(ctx, hits, limit, false)
+}
+
+/// Prints results, optionally with selection numbers.
+pub fn print_numbered(ctx: &Context, hits: &[Hit], limit: usize, numbered: bool) {
     let s = &ctx.ui.style;
 
-    for hit in hits.iter().take(limit) {
+    for (index, hit) in hits.iter().take(limit).enumerate() {
         let pkg = &hit.package;
         let origin = s.paint(
             if pkg.origin.is_aur() {
@@ -137,7 +142,12 @@ pub fn print(ctx: &Context, hits: &[Hit], limit: usize) {
             tags.push(s.dim(&format!("({:.1})", pkg.popularity)));
         }
 
-        println!("{origin}/{name} {version} {}", tags.join(" "));
+        let prefix = if numbered {
+            format!("{} ", s.paint(Color::Amber, &format!("{:>2}", index + 1)))
+        } else {
+            String::new()
+        };
+        println!("{prefix}{origin}/{name} {version} {}", tags.join(" "));
         if !pkg.description.is_empty() {
             println!("    {}", s.dim(&pkg.description));
         }
@@ -152,6 +162,57 @@ pub fn print(ctx: &Context, hits: &[Hit], limit: usize) {
             ))
         );
     }
+}
+
+/// Parses a yay-style selection over `count` numbered results.
+///
+/// Accepts individual numbers, inclusive ranges (`2-4`), and exclusions
+/// (`^3`, `^2-4`). Exclusions apply to everything selected so far, or to the
+/// whole list when nothing was selected explicitly — so `^2` means "all but
+/// the second". Out-of-range and unparseable entries are ignored rather than
+/// failing the whole selection.
+pub fn parse_selection(input: &str, count: usize) -> Vec<usize> {
+    let mut included: Vec<usize> = Vec::new();
+    let mut excluded: Vec<usize> = Vec::new();
+    let mut saw_include = false;
+
+    let expand = |token: &str| -> Vec<usize> {
+        match token.split_once('-') {
+            Some((from, to)) => {
+                let (Ok(from), Ok(to)) = (from.trim().parse::<usize>(), to.trim().parse::<usize>())
+                else {
+                    return Vec::new();
+                };
+                let (low, high) = if from <= to { (from, to) } else { (to, from) };
+                (low..=high).collect()
+            }
+            None => token.trim().parse::<usize>().map(|n| vec![n]).unwrap_or_default(),
+        }
+    };
+
+    for token in input.split([' ', ',']).filter(|t| !t.trim().is_empty()) {
+        match token.strip_prefix('^') {
+            Some(rest) => excluded.extend(expand(rest)),
+            None => {
+                saw_include = true;
+                included.extend(expand(token));
+            }
+        }
+    }
+
+    // A selection made only of exclusions starts from everything.
+    if !saw_include && !excluded.is_empty() {
+        included = (1..=count).collect();
+    }
+
+    let mut chosen: Vec<usize> = included
+        .into_iter()
+        .filter(|n| *n >= 1 && *n <= count && !excluded.contains(n))
+        .collect();
+
+    chosen.sort_unstable();
+    chosen.dedup();
+    chosen
 }
 
 #[cfg(test)]
@@ -184,6 +245,41 @@ mod tests {
         let repo = pkg("spotify", "music", Origin::Repo("extra".into()));
         let aur = pkg("spotify", "music", Origin::Aur);
         assert!(score(&repo, "spotify") < score(&aur, "spotify"));
+    }
+
+    #[test]
+    fn parses_individual_numbers_and_ranges() {
+        assert_eq!(parse_selection("1 3 5", 10), vec![1, 3, 5]);
+        assert_eq!(parse_selection("2-4", 10), vec![2, 3, 4]);
+        assert_eq!(parse_selection("1,3", 10), vec![1, 3]);
+        assert_eq!(parse_selection("1 2-4 7", 10), vec![1, 2, 3, 4, 7]);
+        // A reversed range still means the same span.
+        assert_eq!(parse_selection("4-2", 10), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn exclusions_subtract_from_everything_when_alone() {
+        assert_eq!(parse_selection("^2", 4), vec![1, 3, 4]);
+        assert_eq!(parse_selection("^2-3", 5), vec![1, 4, 5]);
+    }
+
+    #[test]
+    fn exclusions_subtract_from_an_explicit_selection() {
+        assert_eq!(parse_selection("1-5 ^3", 10), vec![1, 2, 4, 5]);
+    }
+
+    #[test]
+    fn out_of_range_and_junk_are_ignored() {
+        assert_eq!(parse_selection("0 1 99", 3), vec![1]);
+        assert_eq!(parse_selection("abc 2 !!", 3), vec![2]);
+        // Duplicates collapse.
+        assert_eq!(parse_selection("2 2 2", 3), vec![2]);
+    }
+
+    #[test]
+    fn empty_selection_chooses_nothing() {
+        assert!(parse_selection("", 5).is_empty());
+        assert!(parse_selection("   ", 5).is_empty());
     }
 
     #[test]

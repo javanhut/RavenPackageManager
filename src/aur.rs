@@ -88,6 +88,10 @@ impl RpcPackage {
             out_of_date: self.out_of_date.is_some(),
             backup: Vec::new(),
             install_reason: crate::pkg::InstallReason::default(),
+            arch: None,
+            base: None,
+            build_date: 0,
+            validation: crate::pkg::Validation::default(),
         }
     }
 }
@@ -151,6 +155,28 @@ impl Aur {
         let url = format!("{RPC_BASE}/search/{}?by=name-desc", encode(term));
         let body = fetch::get_string(&url).map_err(|e| e.to_string())?;
         parse_rpc(&body)
+    }
+
+    /// Warms the cache for many packages in as few requests as possible.
+    ///
+    /// Resolution and update checks otherwise ask about one package per HTTP
+    /// round trip, which on a system with many AUR packages dominates the
+    /// runtime. The RPC accepts many `arg[]` values at once, so requests are
+    /// batched — bounded only to keep the URL within server limits.
+    pub fn prefetch(&self, names: &[String]) -> Result<usize, String> {
+        if self.offline || names.is_empty() {
+            return Ok(0);
+        }
+
+        const BATCH: usize = 100;
+        let mut found = 0;
+
+        for chunk in names.chunks(BATCH) {
+            let packages = self.info(chunk)?;
+            found += packages.len();
+        }
+
+        Ok(found)
     }
 
     /// Exact metadata for one or more package names.
@@ -236,8 +262,18 @@ impl SrcInfo {
         }
     }
 
-    /// Parses the tab-indented `key = value` format written by makepkg.
+    /// Parses the tab-indented `key = value` format written by makepkg, for
+    /// the machine's own architecture.
     pub fn parse(text: &str) -> SrcInfo {
+        SrcInfo::parse_for_arch(text, &crate::config::detect_arch())
+    }
+
+    /// Parses a `.SRCINFO`, honouring architecture-suffixed keys.
+    ///
+    /// A `.SRCINFO` lists `depends_x86_64` alongside `depends_aarch64`;
+    /// folding every suffix into the base key would apply another
+    /// architecture's dependencies to this machine.
+    pub fn parse_for_arch(text: &str, arch: &str) -> SrcInfo {
         let mut info = SrcInfo::default();
 
         for line in text.lines() {
@@ -262,9 +298,13 @@ impl SrcInfo {
                 "epoch" => info.epoch = Some(value.to_string()),
                 "source" => info.sources.push(value.to_string()),
                 _ => {
-                    // Architecture-suffixed keys (`depends_x86_64`) count as
-                    // their base key.
-                    let base = key.split('_').next().unwrap_or(key);
+                    // `depends_aarch64` counts as `depends`, but only when the
+                    // suffix names this machine.
+                    let base = match key.split_once('_') {
+                        Some((base, suffix)) if suffix == arch => base,
+                        Some(_) => continue,
+                        None => key,
+                    };
                     match base {
                         "depends" => info.depends.push(Dep::parse(value)),
                         "makedepends" => info.makedepends.push(Dep::parse(value)),
@@ -366,6 +406,7 @@ pkgbase = mytool
 \tdepends = glibc
 \tdepends = openssl>=3.0
 \tdepends_x86_64 = lib32-glibc
+\tdepends_aarch64 = aarch64-only-lib
 \tmakedepends = rust
 \tcheckdepends = python-pytest
 \tprovides = mytool-bin=1.4.0
@@ -376,8 +417,27 @@ pkgname = mytool-docs
 ";
 
     #[test]
+    fn architecture_suffixed_keys_only_apply_to_that_architecture() {
+        let x86 = SrcInfo::parse_for_arch(SRCINFO, "x86_64");
+        let names: Vec<String> = x86.depends.iter().map(|d| d.name.clone()).collect();
+        assert!(names.contains(&"lib32-glibc".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"aarch64-only-lib".to_string()),
+            "another architecture's dependency must not apply: {names:?}"
+        );
+
+        let arm = SrcInfo::parse_for_arch(SRCINFO, "aarch64");
+        let names: Vec<String> = arm.depends.iter().map(|d| d.name.clone()).collect();
+        assert!(names.contains(&"aarch64-only-lib".to_string()), "{names:?}");
+        assert!(!names.contains(&"lib32-glibc".to_string()), "{names:?}");
+
+        // Unsuffixed dependencies apply everywhere.
+        assert!(names.contains(&"glibc".to_string()));
+    }
+
+    #[test]
     fn parses_srcinfo() {
-        let info = SrcInfo::parse(SRCINFO);
+        let info = SrcInfo::parse_for_arch(SRCINFO, "x86_64");
         assert_eq!(info.pkgbase, "mytool");
         assert_eq!(info.pkgver, "1.4.0");
         assert_eq!(info.pkgrel, "2");

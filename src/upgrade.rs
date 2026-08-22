@@ -18,6 +18,8 @@ pub enum Kind {
     Replacement { replaces: String },
     /// The installed version is newer than what the repositories carry.
     Downgrade,
+    /// A VCS package whose upstream has moved since it was built.
+    Devel,
 }
 
 #[derive(Debug, Clone)]
@@ -334,6 +336,14 @@ mod tests {
         // Asking about `oldname` specifically must not silently rename it.
         let found = candidates(&local, &sync, &NoAur, Some(&["oldname".to_string()]));
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn devel_is_distinct_from_a_version_upgrade() {
+        // A devel rebuild carries no comparable version, so it must not be
+        // mistaken for a downgrade and filtered out.
+        assert_ne!(Kind::Devel, Kind::Downgrade);
+        assert_ne!(Kind::Devel, Kind::Upgrade);
     }
 
     #[test]

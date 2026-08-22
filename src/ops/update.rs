@@ -4,8 +4,7 @@
 //! what is out of date, then hands those names to the same resolve → fetch →
 //! verify → unpack machinery that `install` uses.
 
-use super::{Context, install, remove, sync};
-use crate::remove::Options as RemoveOptions;
+use super::{Context, install, sync};
 use crate::ui::theme::{Color, bytes};
 use crate::upgrade::{self, Candidate, Kind};
 
@@ -43,7 +42,57 @@ pub fn run(ctx: &mut Context, targets: &[String], refresh: bool) -> Result<Outco
         } else {
             Some(targets)
         };
-        let found = upgrade::candidates(&ctx.local, &ctx.sync, &ctx.aur, only.map(|t| &t[..]));
+
+        // Ask about every AUR package in one batch rather than one request
+        // per package.
+        let foreign: Vec<String> = ctx
+            .local
+            .packages
+            .values()
+            .filter(|p| ctx.sync.iter().all(|db| db.get(&p.name).is_none()))
+            .filter(|p| only.map(|t| t.contains(&p.name)).unwrap_or(true))
+            .map(|p| p.name.clone())
+            .collect();
+
+        if !foreign.is_empty() && !ctx.repo_only {
+            spinner.set_message(&format!("querying the AUR about {} packages", foreign.len()));
+            if let Err(e) = ctx.aur.prefetch(&foreign) {
+                ctx.ui.warn(&format!("AUR query failed: {e}"));
+            }
+        }
+
+        let mut found = upgrade::candidates(&ctx.local, &ctx.sync, &ctx.aur, only.map(|t| &t[..]));
+
+        // A VCS package's recorded version never moves on its own, so upstream
+        // has to be asked directly.
+        let devel_names: Vec<String> = foreign
+            .iter()
+            .filter(|name| crate::devel::is_devel(name))
+            .cloned()
+            .collect();
+
+        if !devel_names.is_empty() && !ctx.repo_only {
+            spinner.set_message(&format!(
+                "checking {} devel package{} against upstream",
+                devel_names.len(),
+                if devel_names.len() == 1 { "" } else { "s" }
+            ));
+            for name in crate::devel::outdated(&ctx.devel, &devel_names) {
+                if found.iter().any(|c| c.name == name) {
+                    continue;
+                }
+                if let Some(installed) = ctx.local.get(&name) {
+                    found.push(Candidate {
+                        name: name.clone(),
+                        installed_version: installed.version.clone(),
+                        new_version: "latest commit".to_string(),
+                        origin: crate::pkg::Origin::Aur,
+                        kind: Kind::Devel,
+                        download_size: 0,
+                    });
+                }
+            }
+        }
 
         spinner.succeed(&format!(
             "{} update{} available",
@@ -111,45 +160,24 @@ pub fn run(ctx: &mut Context, targets: &[String], refresh: bool) -> Result<Outco
     let previously_assumed = ctx.assume_yes;
     ctx.assume_yes = true;
 
+    // A devel package's version is unchanged by definition, so the resolver
+    // would otherwise treat it as already satisfied and skip the rebuild.
+    ctx.force_rebuild = applicable
+        .iter()
+        .filter(|c| c.kind == Kind::Devel)
+        .map(|c| c.name.clone())
+        .collect();
+
     let names: Vec<String> = applicable.iter().map(|c| c.name.clone()).collect();
     let result = install::execute(ctx, &names);
 
+    ctx.force_rebuild.clear();
     ctx.assume_yes = previously_assumed;
     let outcome = result?;
 
-    // ---- retire replaced packages --------------------------------------
-    let mut replaced = Vec::new();
-    let superseded: Vec<String> = applicable
-        .iter()
-        .filter_map(|c| match &c.kind {
-            Kind::Replacement { replaces } => Some(replaces.clone()),
-            _ => None,
-        })
-        // Only retire something the successor actually installed over.
-        .filter(|old| outcome.installed.iter().any(|new| new != old))
-        .collect();
-
-    if !superseded.is_empty() {
-        ctx.ui.blank();
-        let spinner = ctx
-            .ui
-            .stage(&format!("retiring {}", superseded.join(", ")));
-
-        // The successor already provides what these offered, so the reverse
-        // dependency check would fire spuriously here.
-        let plan = crate::remove::plan(
-            &ctx.local,
-            &superseded,
-            RemoveOptions {
-                nodeps: true,
-                ..Default::default()
-            },
-        );
-        spinner.clear();
-
-        let removed = remove::apply(ctx, &plan)?;
-        replaced = removed.removed;
-    }
+    // Replaced packages are retired by the install pipeline itself, which
+    // knows the successors actually landed.
+    let replaced = outcome.replaced.clone();
 
     ctx.ui.blank();
     ctx.ui.ok(&format!(
@@ -177,18 +205,27 @@ fn show_candidates(ctx: &Context, applicable: &[Candidate], downgrades: &[Candid
             },
             c.origin.label(),
         );
-        let mut line = format!(
-            "{origin}/{} {} {} {}",
-            s.bold(&c.name),
-            s.dim(&c.installed_version),
-            s.glyphs.arrow,
-            s.paint(Color::Green, &c.new_version)
-        );
-        if let Kind::Replacement { replaces } = &c.kind {
-            line.push_str(&format!(
+        let mut line = if c.kind == Kind::Devel {
+            format!("{origin}/{} {}", s.bold(&c.name), s.dim(&c.installed_version))
+        } else {
+            format!(
+                "{origin}/{} {} {} {}",
+                s.bold(&c.name),
+                s.dim(&c.installed_version),
+                s.glyphs.arrow,
+                s.paint(Color::Green, &c.new_version)
+            )
+        };
+        match &c.kind {
+            Kind::Replacement { replaces } => line.push_str(&format!(
                 " {}",
                 s.paint(Color::Amber, &format!("(replaces {replaces})"))
-            ));
+            )),
+            Kind::Devel => line.push_str(&format!(
+                " {}",
+                s.paint(Color::Cyan, "(upstream moved — rebuild)")
+            )),
+            _ => {}
         }
         line
     };
