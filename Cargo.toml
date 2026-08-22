@@ -1,0 +1,11 @@
+[package]
+name = "ravenpackagemanager"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = "4.6.6"
+
+[[bin]]
+name = "rvn"
+path = "src/main.rs"
