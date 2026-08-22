@@ -114,6 +114,16 @@ pub fn db_url(server: &str, repo: &str) -> String {
     format!("{}/{}.db", server.trim_end_matches('/'), repo)
 }
 
+/// Where a repo's database signature is cached.
+pub fn db_sig_file(cfg: &Config, repo: &str) -> PathBuf {
+    cfg.sync_db_path().join(format!("{repo}.db.sig"))
+}
+
+/// The URL a repo's database signature is fetched from.
+pub fn db_sig_url(server: &str, repo: &str) -> String {
+    format!("{}.sig", db_url(server, repo))
+}
+
 /// Loads every configured repo that has a cached database. Repos whose
 /// database is missing are reported so the caller can offer to sync.
 pub fn load_all(cfg: &Config) -> (Vec<SyncDb>, Vec<String>) {
@@ -230,6 +240,14 @@ mod tests {
     }
 
     #[test]
+    fn builds_signature_urls_alongside_databases() {
+        assert_eq!(
+            db_sig_url("https://mirror/core/os/x86_64", "core"),
+            "https://mirror/core/os/x86_64/core.db.sig"
+        );
+    }
+
+    #[test]
     fn builds_urls() {
         assert_eq!(
             db_url("https://mirror/core/os/x86_64/", "core"),
@@ -238,7 +256,7 @@ mod tests {
         let repo = Repo {
             name: "core".into(),
             servers: vec!["https://a/core/os/x86_64".into(), "https://b/core".into()],
-            siglevel: crate::config::SigLevel::Required,
+            siglevel: crate::config::SigLevel::default_level(),
         };
         let urls = package_urls(&repo, "go-1.22.0-1-x86_64.pkg.tar.zst");
         assert_eq!(urls.len(), 2);

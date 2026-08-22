@@ -12,7 +12,7 @@ use crate::pkg::{BackupFile, InstallReason, Package};
 use crate::resolve::{NoSource, Plan, Resolved, Resolver};
 use crate::scriptlet::{self, Hook};
 use crate::ui::theme::{Color, bytes, bytes_signed};
-use crate::config::SigLevel;
+use crate::config::Level;
 use crate::verify::{self, Verified};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -839,7 +839,7 @@ fn fetch_package(
     fetch::download_with_mirrors(&urls, &dest, Some(progress)).map_err(|e| e.to_string())?;
 
     // Fetch the detached signature when the repo expects one.
-    if pkg.has_sig && repo.siglevel != SigLevel::Never {
+    if pkg.has_sig && repo.siglevel.package.is_checked() {
         let sig_urls: Vec<String> = urls.iter().map(|u| format!("{u}.sig")).collect();
         let sig_dest = signature_path(&dest);
         let _ = fetch::download_with_mirrors(&sig_urls, &sig_dest, None);
@@ -850,12 +850,12 @@ fn fetch_package(
 
 /// Runs checksum and signature verification for one downloaded package.
 fn verify_one(ctx: &Context, pkg: &Package, path: &Path) -> Result<Verified, String> {
-    let siglevel = ctx
+    let level = ctx
         .config
         .repo(pkg.origin.label())
-        .map(|r| r.siglevel)
+        .map(|r| r.siglevel.package)
         // A locally built package has no repo entry and no signature.
-        .unwrap_or(SigLevel::Never);
+        .unwrap_or(Level::Never);
 
     let signature = std::fs::read(signature_path(path)).ok();
 
@@ -864,7 +864,7 @@ fn verify_one(ctx: &Context, pkg: &Package, path: &Path) -> Result<Verified, Str
         pkg.sha256.as_deref(),
         signature.as_deref(),
         ctx.keyring.as_ref(),
-        siglevel,
+        level,
     )
     .map_err(|e| e.to_string())
 }

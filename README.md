@@ -19,7 +19,7 @@ official repositories and the AUR are both handled by a single binary, so neithe
 | Version comparison | Full `alpm_pkg_vercmp` port, including epochs and release ordering |
 | Dependency resolution | Transitive resolution with provides, versioned constraints, conflicts and cycle handling |
 | Download | Streaming fetch with mirror failover and resumable `.part` files |
-| Verification | SHA-256 from the sync database, plus detached PGP signatures checked against the pacman keyring |
+| Verification | SHA-256 from the sync database, plus detached PGP signatures on both packages and repository databases, checked against the pacman keyring |
 | Extraction | zstd, xz, gzip and bzip2 tar unpacking with path-traversal rejection and file-conflict detection |
 | AUR | RPC v5 search/info, git checkout, `.SRCINFO` parsing, and building |
 | Scriptlets | `.INSTALL` hooks run around install, upgrade and removal |
@@ -302,6 +302,28 @@ the files are already on disk, and unwinding would leave a worse state behind.
 ```bash
 rvn sync
 ```
+
+Databases are verified against their detached signature before being used:
+
+```
+  ✔  core synced (249 KB) · signature verified
+```
+
+`SigLevel` is honoured separately for packages and databases, as pacman does, so
+`SigLevel = Required DatabaseOptional` means a package signature is mandatory while
+a database signature is checked only when the repository publishes one. A database
+signature that is present but does not match is always fatal — that is a tampered
+database, not a missing convenience — and the file is discarded rather than left
+for the next command to read.
+
+| Token | Effect |
+| --- | --- |
+| `Never` / `Optional` / `Required` | Sets both packages and databases |
+| `PackageNever` / `PackageOptional` / `PackageRequired` | Packages only |
+| `DatabaseNever` / `DatabaseOptional` / `DatabaseRequired` | Databases only |
+
+Neither Arch nor Arch Linux ARM currently publishes `.db.sig` files, which is why
+the shipped configuration uses `DatabaseOptional`.
 
 ## Global Options
 

@@ -15,26 +15,77 @@ pub struct Repo {
     pub siglevel: SigLevel,
 }
 
+/// How strictly a signature is demanded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SigLevel {
+pub enum Level {
+    /// Do not fetch or check signatures at all.
     Never,
+    /// Check a signature when one is available; a bad one is still fatal.
     Optional,
+    /// A valid signature is mandatory.
     Required,
 }
 
+impl Level {
+    pub fn is_checked(self) -> bool {
+        self != Level::Never
+    }
+}
+
+/// Signature policy, which pacman tracks separately for packages and for the
+/// repository databases themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SigLevel {
+    pub package: Level,
+    pub database: Level,
+}
+
 impl SigLevel {
+    /// Arch ships `SigLevel = Required DatabaseOptional`, which is what a
+    /// configuration without an explicit setting is assumed to mean.
+    pub const fn default_level() -> SigLevel {
+        SigLevel {
+            package: Level::Required,
+            database: Level::Optional,
+        }
+    }
+
+    /// Applies a whitespace-separated list of `SigLevel` tokens on top of an
+    /// inherited policy.
+    ///
+    /// A bare `Required`/`Optional`/`Never` sets both halves; a `Package`- or
+    /// `Database`-prefixed token sets only its own, and later tokens win —
+    /// which is what makes `Required DatabaseOptional` mean strict packages
+    /// and lenient databases.
     fn parse(values: &str, inherited: SigLevel) -> SigLevel {
         let mut level = inherited;
+
         for token in values.split_whitespace() {
             match token {
-                "Never" | "PackageNever" => level = SigLevel::Never,
-                "Optional" | "PackageOptional" => level = SigLevel::Optional,
-                "Required" | "PackageRequired" => level = SigLevel::Required,
+                "Never" => {
+                    level.package = Level::Never;
+                    level.database = Level::Never;
+                }
+                "Optional" => {
+                    level.package = Level::Optional;
+                    level.database = Level::Optional;
+                }
+                "Required" => {
+                    level.package = Level::Required;
+                    level.database = Level::Required;
+                }
+                "PackageNever" => level.package = Level::Never,
+                "PackageOptional" => level.package = Level::Optional,
+                "PackageRequired" => level.package = Level::Required,
+                "DatabaseNever" => level.database = Level::Never,
+                "DatabaseOptional" => level.database = Level::Optional,
+                "DatabaseRequired" => level.database = Level::Required,
                 // TrustedOnly / TrustAll affect which keys count, not whether
                 // a signature is demanded.
                 _ => {}
             }
         }
+
         level
     }
 }
@@ -101,7 +152,7 @@ impl Config {
         let mut current = String::from("options");
         parse_into(path, &mut sections, 0, &mut current)?;
 
-        let mut global_siglevel = SigLevel::Required;
+        let mut global_siglevel = SigLevel::default_level();
 
         for (section, entries) in &sections {
             if section == "options" {
@@ -347,10 +398,13 @@ mod tests {
         assert_eq!(core.servers.len(), 2);
         // $repo and $arch must both be substituted.
         assert_eq!(core.servers[0], "https://mirror.one/core/os/x86_64");
-        assert_eq!(core.siglevel, SigLevel::Required);
+        // `Required DatabaseOptional` must not make databases mandatory.
+        assert_eq!(core.siglevel.package, Level::Required);
+        assert_eq!(core.siglevel.database, Level::Optional);
 
         let custom = cfg.repo("custom").expect("custom repo");
-        assert_eq!(custom.siglevel, SigLevel::Never);
+        assert_eq!(custom.siglevel.package, Level::Never);
+        assert_eq!(custom.siglevel.database, Level::Never);
         assert_eq!(custom.servers, vec!["file:///opt/repo"]);
     }
 
@@ -369,7 +423,7 @@ mod tests {
 
         let cfg = Config::load(&conf).unwrap();
         let repo = cfg.repo("myrepo").expect("repo from the included file");
-        assert_eq!(repo.siglevel, SigLevel::Never);
+        assert_eq!(repo.siglevel.package, Level::Never);
         assert_eq!(repo.servers, vec!["https://my.host/myrepo"]);
     }
 
@@ -451,6 +505,38 @@ mod tests {
 
         let names: Vec<&str> = cfg.repos.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["ay", "bee"], "sorted, and .txt excluded");
+    }
+
+    #[test]
+    fn siglevel_tokens_apply_in_order() {
+        let base = SigLevel::default_level();
+
+        // A bare keyword sets both halves.
+        let both = SigLevel::parse("Never", base);
+        assert_eq!(both.package, Level::Never);
+        assert_eq!(both.database, Level::Never);
+
+        // A prefixed token overrides only its own half, and later wins.
+        let mixed = SigLevel::parse("Required DatabaseNever", base);
+        assert_eq!(mixed.package, Level::Required);
+        assert_eq!(mixed.database, Level::Never);
+
+        let reversed = SigLevel::parse("DatabaseNever Required", base);
+        assert_eq!(reversed.database, Level::Required, "later tokens win");
+
+        // Trust tokens say which keys count, not whether to check.
+        let trust = SigLevel::parse("Required TrustedOnly", base);
+        assert_eq!(trust.package, Level::Required);
+    }
+
+    #[test]
+    fn a_repo_inherits_the_global_siglevel() {
+        let conf = write_temp(
+            "inherit-siglevel.conf",
+            "[options]\nSigLevel = Never\n\n[core]\nServer = https://a/$repo\n",
+        );
+        let cfg = Config::load(&conf).unwrap();
+        assert_eq!(cfg.repo("core").unwrap().siglevel.package, Level::Never);
     }
 
     #[test]

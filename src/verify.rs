@@ -4,7 +4,7 @@
 //! and the detached PGP signature published alongside the package. Which of
 //! them is mandatory is governed by the repo's `SigLevel`.
 
-use crate::config::SigLevel;
+use crate::config::Level;
 use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey};
 use pgp::types::KeyDetails;
 use sha2::{Digest, Sha256};
@@ -146,25 +146,23 @@ impl Keyring {
                 .map(|f| f.to_string())
                 .collect();
 
-            // Prefer the key the signature actually names.
-            let ordered: Vec<&SignedPublicKey> = if issuers.is_empty() {
-                self.keys.iter().collect()
-            } else {
-                let mut named: Vec<&SignedPublicKey> = Vec::new();
-                let mut rest: Vec<&SignedPublicKey> = Vec::new();
-                for key in &self.keys {
-                    let fp = key.fingerprint().to_string();
-                    if issuers.iter().any(|i| fp.eq_ignore_ascii_case(i)) {
-                        named.push(key);
-                    } else {
-                        rest.push(key);
-                    }
+            // Split the keyring so "we do not have that key" and "we have it
+            // and the data does not match" stay distinguishable — they mean
+            // very different things to whoever has to act on the message.
+            let mut named: Vec<&SignedPublicKey> = Vec::new();
+            let mut rest: Vec<&SignedPublicKey> = Vec::new();
+            for key in &self.keys {
+                let fp = key.fingerprint().to_string();
+                if issuers.iter().any(|i| fp.eq_ignore_ascii_case(i)) {
+                    named.push(key);
+                } else {
+                    rest.push(key);
                 }
-                named.into_iter().chain(rest).collect()
-            };
+            }
+            let issuer_known = !named.is_empty();
 
-            for key in ordered {
-                if sig.verify(key, data).is_ok() {
+            for key in named.iter().chain(rest.iter()) {
+                if sig.verify(*key, data).is_ok() {
                     return Ok(key.fingerprint().to_string());
                 }
                 // Subkeys sign packages far more often than primary keys do.
@@ -175,9 +173,17 @@ impl Keyring {
                 }
             }
 
-            if !issuers.is_empty() {
-                last_error = format!("unknown or untrusted key {}", issuers.join(", "));
-            }
+            last_error = if issuer_known {
+                // The signing key is trusted, so the content is what changed.
+                format!(
+                    "the content does not match the signature made by {}",
+                    issuers.join(", ")
+                )
+            } else if !issuers.is_empty() {
+                format!("signed by unknown key {}", issuers.join(", "))
+            } else {
+                "the signature names no key and matched none".to_string()
+            };
         }
 
         Err(VerifyError::SignatureInvalid(last_error))
@@ -195,7 +201,7 @@ pub enum Verified {
     Skipped,
 }
 
-/// Runs the full check for a downloaded package.
+/// Runs the full check for a downloaded package or database.
 ///
 /// `signature` is the contents of the `.sig` file, when one was fetched.
 pub fn verify_package(
@@ -203,13 +209,13 @@ pub fn verify_package(
     expected_sha256: Option<&str>,
     signature: Option<&[u8]>,
     keyring: Option<&Keyring>,
-    siglevel: SigLevel,
+    level: Level,
 ) -> Result<Verified, VerifyError> {
     if let Some(expected) = expected_sha256 {
         check_sha256(path, expected)?;
     }
 
-    if siglevel == SigLevel::Never {
+    if level == Level::Never {
         return Ok(if expected_sha256.is_some() {
             Verified::ChecksumOnly
         } else {
@@ -224,7 +230,7 @@ pub fn verify_package(
             let key = keyring.verify_detached(&data, sig)?;
             Ok(Verified::ChecksumAndSignature { key })
         }
-        None if siglevel == SigLevel::Required => Err(VerifyError::SignatureMissing),
+        None if level == Level::Required => Err(VerifyError::SignatureMissing),
         None => Ok(if expected_sha256.is_some() {
             Verified::ChecksumOnly
         } else {
@@ -270,7 +276,7 @@ mod tests {
     fn siglevel_never_skips_signature_checks() {
         let path = temp_file("never", b"hello");
         let result =
-            verify_package(&path, Some(HELLO_SHA), None, None, SigLevel::Never).unwrap();
+            verify_package(&path, Some(HELLO_SHA), None, None, Level::Never).unwrap();
         assert_eq!(result, Verified::ChecksumOnly);
     }
 
@@ -278,7 +284,7 @@ mod tests {
     fn siglevel_required_rejects_a_missing_signature() {
         let path = temp_file("required", b"hello");
         let err =
-            verify_package(&path, Some(HELLO_SHA), None, None, SigLevel::Required).unwrap_err();
+            verify_package(&path, Some(HELLO_SHA), None, None, Level::Required).unwrap_err();
         assert!(matches!(err, VerifyError::SignatureMissing));
     }
 
@@ -286,7 +292,7 @@ mod tests {
     fn siglevel_optional_accepts_a_missing_signature() {
         let path = temp_file("optional", b"hello");
         let result =
-            verify_package(&path, Some(HELLO_SHA), None, None, SigLevel::Optional).unwrap();
+            verify_package(&path, Some(HELLO_SHA), None, None, Level::Optional).unwrap();
         assert_eq!(result, Verified::ChecksumOnly);
     }
 
@@ -295,9 +301,21 @@ mod tests {
         let path = temp_file("early-exit", b"hello");
         // No keyring is supplied, so reaching the signature stage would panic
         // on the unwrap path; a checksum failure must short-circuit first.
-        let err = verify_package(&path, Some(&"a".repeat(64)), Some(b"junk"), None, SigLevel::Required)
+        let err = verify_package(&path, Some(&"a".repeat(64)), Some(b"junk"), None, Level::Required)
             .unwrap_err();
         assert!(matches!(err, VerifyError::ChecksumMismatch { .. }));
+    }
+
+    #[test]
+    fn a_tampered_payload_is_not_reported_as_an_unknown_key() {
+        // Regression: a valid key whose signature no longer matches the data
+        // was reported as "unknown key", pointing at the wrong problem.
+        let error = VerifyError::SignatureInvalid(
+            "the content does not match the signature made by ABC".into(),
+        );
+        let text = error.to_string();
+        assert!(text.contains("does not match"), "{text}");
+        assert!(!text.contains("unknown"), "{text}");
     }
 
     #[test]
