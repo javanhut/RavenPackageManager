@@ -56,10 +56,44 @@ impl From<io::Error> for FetchError {
     }
 }
 
+/// How long a mirror may sit on an accepted connection before it is written
+/// off. Without this, a server that completes the handshake and then goes
+/// quiet holds the whole command open forever — a mirrorlist of any size
+/// reliably contains a few.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How many mirrors are asked for a file the repository may not publish at
+/// all. A mirrorlist can hold well over a hundred servers, and walking every
+/// one of them to learn that none carries the file costs minutes.
+pub const OPTIONAL_MIRROR_LIMIT: usize = 3;
+
+/// How many mirrors must independently answer "no such file" before rvn
+/// concludes it is not published, rather than that one mirror is behind.
+const ABSENT_QUORUM: usize = 2;
+
+/// The whole exchange for an optional file, which is small by definition.
+const OPTIONAL_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .user_agent(USER_AGENT)
         .timeout_connect(Some(Duration::from_secs(15)))
+        // This bounds the wait for response headers, not for the body: a
+        // large package over a slow link is slow but healthy, and cutting it
+        // off at a fixed deadline would break exactly the downloads that
+        // matter most.
+        .timeout_recv_response(Some(RESPONSE_TIMEOUT))
+        .build()
+        .into()
+}
+
+/// A stricter agent for the small files rvn is only probing for, where any
+/// delay at all is better spent on the next mirror.
+fn probe_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .user_agent(USER_AGENT)
+        .timeout_connect(Some(Duration::from_secs(5)))
+        .timeout_global(Some(OPTIONAL_TIMEOUT))
         .build()
         .into()
 }
@@ -206,6 +240,100 @@ pub fn download_with_mirrors(
     })
 }
 
+/// The outcome of looking for a file a repository may or may not publish.
+#[derive(Debug)]
+pub enum Optional {
+    Fetched(u64),
+    /// Mirrors agreed there is no such file. Nothing is wrong; the repository
+    /// simply does not publish it.
+    NotPublished,
+    /// No mirror answered, so nothing at all was established. This is not the
+    /// same as `NotPublished`, and a caller that requires the file must treat
+    /// it as a failure rather than as a licence to continue unverified.
+    Unavailable(FetchError),
+}
+
+/// Downloads a file that a repository may legitimately not publish.
+///
+/// Arch's official repositories, for one, ship no `$repo.db.sig`. Asking a
+/// full mirrorlist for a file no mirror carries costs a round trip per server
+/// — minutes across a hundred mirrors, and unbounded against one that accepts
+/// the connection and then goes silent. A few mirrors agreeing the file is
+/// absent settles the question.
+pub fn download_optional(urls: &[String], dest: &Path) -> Optional {
+    if urls.is_empty() {
+        return Optional::Unavailable(FetchError::AllMirrorsFailed {
+            url: dest.display().to_string(),
+            attempts: vec!["no mirrors configured".into()],
+        });
+    }
+
+    if let Some(parent) = dest.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return Optional::Unavailable(FetchError::Io(e));
+        }
+    }
+
+    let agent = probe_agent();
+    let mut part = dest.as_os_str().to_os_string();
+    part.push(".part");
+    let part = std::path::PathBuf::from(part);
+
+    let mut absent = 0usize;
+    let mut attempts = Vec::new();
+
+    for url in urls.iter().take(OPTIONAL_MIRROR_LIMIT) {
+        let file = match std::fs::File::create(&part) {
+            Ok(file) => file,
+            Err(e) => return Optional::Unavailable(FetchError::Io(e)),
+        };
+        let mut writer = io::BufWriter::new(file);
+
+        match stream_to(&agent, url, &mut writer, |_| {}) {
+            Ok(total) => {
+                let renamed = writer
+                    .flush()
+                    .and_then(|_| {
+                        drop(writer);
+                        std::fs::rename(&part, dest)
+                    });
+                return match renamed {
+                    Ok(()) => Optional::Fetched(total),
+                    Err(e) => Optional::Unavailable(FetchError::Io(e)),
+                };
+            }
+            Err(e) => {
+                drop(writer);
+                let _ = std::fs::remove_file(&part);
+                // A 404 is the mirror answering the question, not failing to.
+                // Every other error leaves the question open.
+                if matches!(&e, FetchError::Status { code, .. } if *code == 404 || *code == 410) {
+                    absent += 1;
+                    if absent >= ABSENT_QUORUM {
+                        return Optional::NotPublished;
+                    }
+                }
+                attempts.push(format!("{url}: {e}"));
+            }
+        }
+    }
+
+    // A single 404 with nothing to corroborate it is still the only answer
+    // anyone gave, and refusing to act on it would strand repositories served
+    // by one mirror.
+    if absent > 0 {
+        return Optional::NotPublished;
+    }
+
+    Optional::Unavailable(FetchError::AllMirrorsFailed {
+        url: dest
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        attempts,
+    })
+}
+
 /// Whether a cached file can be reused, based on the expected size.
 pub fn cached_ok(path: &Path, expected_size: u64) -> bool {
     match std::fs::metadata(path) {
@@ -237,6 +365,42 @@ mod tests {
         // Size 0 means "unknown", which must not count as a cache hit.
         assert!(!cached_ok(&path, 0));
         assert!(!cached_ok(Path::new("/nonexistent/rvn"), 10));
+    }
+
+    #[test]
+    fn an_optional_file_needs_at_least_one_mirror() {
+        let dest = std::env::temp_dir().join("rvn-optional-no-mirrors.sig");
+        match download_optional(&[], &dest) {
+            Optional::Unavailable(_) => {}
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unreachable_mirror_is_not_read_as_a_missing_file() {
+        // Regression: treating "could not ask" as "there is none" would let a
+        // network outage silently downgrade a DatabaseRequired repository to
+        // an unverified database. Port 1 refuses immediately.
+        let dest = std::env::temp_dir().join("rvn-optional-unreachable.sig");
+        let urls = vec![
+            "http://127.0.0.1:1/core.db.sig".to_string(),
+            "http://127.0.0.1:1/core.db.sig".to_string(),
+        ];
+        match download_optional(&urls, &dest) {
+            Optional::Unavailable(_) => {}
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+        // A failed probe must not leave its scratch file behind.
+        assert!(!dest.with_extension("sig.part").exists());
+    }
+
+    #[test]
+    fn optional_probes_stop_well_short_of_a_full_mirrorlist() {
+        // The whole point of the probe: a mirrorlist can hold a hundred-odd
+        // servers, and a file none of them carries must not cost a round trip
+        // to each one.
+        assert!(OPTIONAL_MIRROR_LIMIT <= 5);
+        assert!(ABSENT_QUORUM <= OPTIONAL_MIRROR_LIMIT);
     }
 
     #[test]

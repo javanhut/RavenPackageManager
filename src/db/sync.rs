@@ -124,6 +124,15 @@ pub fn db_sig_url(server: &str, repo: &str) -> String {
     format!("{}.sig", db_url(server, repo))
 }
 
+/// Where rvn records that a repository publishes no database signature.
+///
+/// It sits beside the database it describes so that clearing the sync
+/// directory clears the marker with it, and so an administrator reading the
+/// directory finds the note next to what it refers to.
+pub fn db_nosig_file(cfg: &Config, repo: &str) -> PathBuf {
+    cfg.sync_db_path().join(format!("{repo}.db.nosig"))
+}
+
 /// Loads every configured repo that has a cached database. Repos whose
 /// database is missing are reported so the caller can offer to sync.
 pub fn load_all(cfg: &Config) -> (Vec<SyncDb>, Vec<String>) {
@@ -237,6 +246,16 @@ mod tests {
         )]);
         let db = SyncDb::from_tar("core", &tar[..]).unwrap();
         assert_eq!(db.get("app").unwrap().depends[0].name, "glibc");
+    }
+
+    #[test]
+    fn the_marker_sits_beside_the_database_it_describes() {
+        let mut cfg = Config::default();
+        cfg.db_path = PathBuf::from("/var/lib/pacman");
+        assert_eq!(
+            db_nosig_file(&cfg, "core"),
+            db_file(&cfg, "core").with_extension("db.nosig")
+        );
     }
 
     #[test]
