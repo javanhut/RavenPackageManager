@@ -1,0 +1,167 @@
+//! rvn's terminal interface.
+//!
+//! All interface output goes to stderr so that machine-readable results on
+//! stdout stay pipeable.
+
+pub mod progress;
+pub mod spinner;
+pub mod theme;
+
+use progress::{Progress, Unit};
+use spinner::Spinner;
+use std::io::{BufRead, Write};
+use theme::{Color, Style};
+
+pub struct Ui {
+    pub style: Style,
+}
+
+impl Ui {
+    pub fn new() -> Ui {
+        Ui {
+            style: Style::detect(),
+        }
+    }
+
+    pub fn plain() -> Ui {
+        Ui {
+            style: Style::plain(),
+        }
+    }
+
+    /// The masthead shown at the start of an operation.
+    pub fn banner(&self, subtitle: &str) {
+        let s = &self.style;
+        let mark = s.paint(Color::Violet, if s.unicode { "𝗿𝘃𝗻" } else { "rvn" });
+        let name = s.bold(&s.paint(Color::White, "raven"));
+        let mut err = std::io::stderr();
+        let _ = writeln!(err, "\n {mark}  {name} {}", s.dim(subtitle));
+    }
+
+    /// Starts an animated stage. The returned handle must be settled.
+    pub fn stage(&self, message: &str) -> Spinner {
+        Spinner::start(self.style, message)
+    }
+
+    /// A progress bar measured in bytes, reporting throughput.
+    pub fn progress(&self, label: &str, total: u64) -> Progress {
+        Progress::new(self.style, label, total)
+    }
+
+    /// A progress bar measured in a plain count of `noun`.
+    pub fn counter(&self, label: &str, total: u64, noun: &'static str) -> Progress {
+        Progress::with_unit(self.style, label, total, Unit::Count(noun))
+    }
+
+    fn line(&self, color: Color, glyph: &str, message: &str) {
+        let mut err = std::io::stderr();
+        let _ = writeln!(err, "  {}  {}", self.style.paint(color, glyph), message);
+    }
+
+    pub fn ok(&self, message: &str) {
+        self.line(Color::Green, self.style.glyphs.ok, message);
+    }
+
+    pub fn err(&self, message: &str) {
+        self.line(Color::Red, self.style.glyphs.fail, message);
+    }
+
+    pub fn warn(&self, message: &str) {
+        self.line(Color::Amber, self.style.glyphs.warn, message);
+    }
+
+    pub fn info(&self, message: &str) {
+        self.line(Color::Slate, self.style.glyphs.info, message);
+    }
+
+    pub fn step(&self, message: &str) {
+        self.line(Color::Violet, self.style.glyphs.bullet, message);
+    }
+
+    /// A blank separator line.
+    pub fn blank(&self) {
+        let _ = writeln!(std::io::stderr());
+    }
+
+    /// An indented detail line under the most recent step.
+    pub fn detail(&self, message: &str) {
+        let mut err = std::io::stderr();
+        let _ = writeln!(err, "     {}", self.style.dim(message));
+    }
+
+    /// Renders a tree of child lines beneath a heading.
+    pub fn tree(&self, items: &[String]) {
+        let g = self.style.glyphs;
+        let mut err = std::io::stderr();
+        for (i, item) in items.iter().enumerate() {
+            let branch = if i + 1 == items.len() {
+                g.tree_end
+            } else {
+                g.tree_mid
+            };
+            let _ = writeln!(err, "     {} {}", self.style.dim(branch), item);
+        }
+    }
+
+    /// Asks a yes/no question. Non-interactive sessions take `default`
+    /// without blocking, so scripted use never hangs.
+    pub fn confirm(&self, question: &str, default: bool) -> bool {
+        if !self.style.interactive {
+            return default;
+        }
+
+        let hint = if default { "[Y/n]" } else { "[y/N]" };
+        let mut err = std::io::stderr();
+        let _ = write!(
+            err,
+            "  {}  {} {} ",
+            self.style.paint(Color::Violet, self.style.glyphs.bullet),
+            question,
+            self.style.dim(hint)
+        );
+        let _ = err.flush();
+
+        let mut answer = String::new();
+        if std::io::stdin().lock().read_line(&mut answer).is_err() {
+            return default;
+        }
+
+        match answer.trim().to_lowercase().as_str() {
+            "" => default,
+            "y" | "yes" => true,
+            _ => false,
+        }
+    }
+}
+
+impl Default for Ui {
+    fn default() -> Self {
+        Ui::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_interactive_confirm_returns_default_without_blocking() {
+        let ui = Ui::plain();
+        assert!(ui.confirm("proceed?", true));
+        assert!(!ui.confirm("proceed?", false));
+    }
+
+    #[test]
+    fn output_helpers_do_not_panic_without_a_terminal() {
+        let ui = Ui::plain();
+        ui.banner("v0.1.0");
+        ui.ok("done");
+        ui.warn("careful");
+        ui.err("broken");
+        ui.info("fyi");
+        ui.step("working");
+        ui.detail("extra");
+        ui.tree(&["one".into(), "two".into()]);
+        ui.blank();
+    }
+}
