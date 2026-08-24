@@ -11,12 +11,16 @@ use crate::fetch;
 use crate::pkg::{BackupFile, InstallReason, Package};
 use crate::resolve::{NoSource, Plan, Resolved, Resolver};
 use crate::scriptlet::{self, Hook};
+use crate::ui::spinner::Spinner;
 use crate::ui::theme::{Color, bytes, bytes_signed};
 use crate::config::Level;
 use crate::verify::{self, Verified};
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 pub struct Outcome {
     pub installed: Vec<String>,
@@ -217,9 +221,7 @@ pub fn execute(ctx: &mut Context, targets: &[String]) -> Result<Outcome, String>
         ctx.ui.blank();
         let spinner = ctx.ui.stage(&format!("building {} (aur)", pkg.name));
 
-        let artifacts = match build_aur(ctx, pkg, &cache, |step| {
-            spinner.set_message(&format!("building {} — {step}", pkg.name));
-        }) {
+        let artifacts = match build_aur(ctx, pkg, &cache, &spinner) {
             Ok(artifacts) => {
                 spinner.succeed(&format!("built {}", pkg.name));
                 artifacts
@@ -1023,8 +1025,9 @@ fn build_aur(
     ctx: &Context,
     pkg: &Package,
     cache: &Path,
-    mut on_step: impl FnMut(&str),
+    spinner: &Spinner,
 ) -> Result<Vec<PathBuf>, String> {
+    let on_step = |step: &str| spinner.set_message(&format!("building {} — {step}", pkg.name));
     let dir = crate::aur::build_dir(cache, &pkg.name);
 
     if Command::new("makepkg").arg("--version").output().is_err() {
@@ -1073,23 +1076,24 @@ fn build_aur(
     // A PKGBUILD is arbitrary code from a stranger, run with the build user's
     // privileges. Offer a look before that happens.
     if !ctx.assume_yes && ctx.ui.style.interactive {
-        review_build_files(ctx, &pkg.name, &dir)?;
+        spinner.suspend(|| review_build_files(ctx, &pkg.name, &dir))?;
     } else {
         ctx.ui.detail(&format!("build files: {}", dir.display()));
     }
 
     on_step("compiling");
-    let output = makepkg_command(&dir, identity.as_ref())
-        .output()
-        .map_err(|e| format!("could not run makepkg: {e}"))?;
+    // makepkg's own log is the only honest progress report a long build has,
+    // so the spinner stands down and hands it the terminal.
+    let (status, log) = spinner.suspend(|| {
+        run_streamed(
+            &mut makepkg_command(&dir, identity.as_ref()),
+            std::io::stderr,
+        )
+        .map_err(|e| format!("could not run makepkg: {e}"))
+    })?;
 
-    if !output.status.success() {
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return Err(explain_build_failure(&combined));
+    if !status.success() {
+        return Err(explain_build_failure(&log));
     }
 
     on_step("collecting artifacts");
@@ -1157,6 +1161,76 @@ fn collect_artifacts(dir: &Path, srcinfo: &SrcInfo) -> Result<Vec<PathBuf>, Stri
     Ok(found)
 }
 
+/// Mirrors one of a child's pipes to `sink` as it arrives, accumulating the
+/// text as it goes.
+///
+/// Reading is byte-oriented rather than line-oriented so that a build which
+/// emits stray non-UTF-8 keeps streaming instead of cutting off mid-log.
+fn mirror<R, W>(pipe: R, mut sink: W, collected: Arc<Mutex<String>>) -> thread::JoinHandle<()>
+where
+    R: std::io::Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = BufReader::new(pipe);
+        let mut raw = Vec::new();
+
+        while matches!(reader.read_until(b'\n', &mut raw), Ok(n) if n > 0) {
+            let line = String::from_utf8_lossy(&raw);
+            let line = line.trim_end_matches(['\n', '\r']);
+
+            // Indented to sit under the stage line, but otherwise verbatim:
+            // makepkg colours its own output, and wrapping it would collide
+            // with the escape sequences already in the text.
+            let _ = writeln!(sink, "     {line}");
+            let _ = sink.flush();
+
+            if let Ok(mut text) = collected.lock() {
+                text.push_str(line);
+                text.push('\n');
+            }
+            raw.clear();
+        }
+    })
+}
+
+/// Runs a command with its output mirrored to `sink` line by line, returning
+/// the exit status alongside everything it printed.
+///
+/// A build that can run for minutes behind a captured pipe is indistinguishable
+/// from a hang, so the output is echoed as it arrives — but it is still
+/// collected, because a failure has to be explained after the fact.
+fn run_streamed<W: Write + Send + 'static>(
+    command: &mut Command,
+    sink: impl Fn() -> W,
+) -> Result<(ExitStatus, String), String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+
+    let collected = Arc::new(Mutex::new(String::new()));
+    // Each pipe gets its own reader: makepkg writes to both, and draining them
+    // one after the other would wedge the build as soon as the pipe nobody is
+    // reading filled its buffer.
+    let out = child
+        .stdout
+        .take()
+        .map(|pipe| mirror(pipe, sink(), Arc::clone(&collected)));
+    let err = child
+        .stderr
+        .take()
+        .map(|pipe| mirror(pipe, sink(), Arc::clone(&collected)));
+
+    let status = child.wait().map_err(|e| e.to_string())?;
+    // Joining after the wait: the readers finish when the pipes close, which
+    // is guaranteed once the process is gone.
+    for reader in [out, err].into_iter().flatten() {
+        let _ = reader.join();
+    }
+
+    let text = collected.lock().map(|t| t.clone()).unwrap_or_default();
+    Ok((status, text))
+}
+
 fn run_command(command: &mut Command) -> Result<(), String> {
     let output = command.output().map_err(|e| e.to_string())?;
     if output.status.success() {
@@ -1172,6 +1246,57 @@ mod tests {
     use super::*;
 
     use crate::aur::SrcInfo;
+
+    /// A shell script run through the streaming runner. Output goes to
+    /// `io::sink` so the suite stays quiet — the mirroring itself is the same
+    /// code path either way.
+    fn streamed(script: &str) -> (ExitStatus, String) {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script);
+        run_streamed(&mut command, std::io::sink).expect("sh should run")
+    }
+
+    #[test]
+    fn streaming_collects_both_pipes_and_the_exit_status() {
+        let (status, log) = streamed("echo to-stdout; echo to-stderr >&2; exit 3");
+
+        assert_eq!(status.code(), Some(3));
+        // A failure is explained from this text after the fact, so makepkg's
+        // errors — which land on stderr — have to survive the streaming.
+        assert!(log.contains("to-stdout"), "{log}");
+        assert!(log.contains("to-stderr"), "{log}");
+    }
+
+    #[test]
+    fn a_build_that_floods_both_pipes_at_once_does_not_deadlock() {
+        // Each pipe gets more than a pipe buffer's worth while the other is
+        // also being written. Draining them in sequence would stall here
+        // forever, which is exactly the hang this runner exists to avoid.
+        let (status, log) = streamed(
+            "line=$(head -c 1200 /dev/zero | tr '\\0' x)
+             i=0; while [ $i -lt 80 ]; do echo \"$line\"; i=$((i+1)); done &
+             j=0; while [ $j -lt 80 ]; do echo \"$line\" >&2; j=$((j+1)); done
+             wait",
+        );
+
+        assert!(status.success());
+        assert_eq!(log.lines().count(), 160);
+    }
+
+    #[test]
+    fn streaming_survives_output_that_is_not_utf8() {
+        let (status, log) = streamed("printf 'good\\n\\377\\nalso-good\\n'");
+
+        assert!(status.success());
+        assert!(log.contains("good"), "{log}");
+        assert!(log.contains("also-good"), "{log}");
+    }
+
+    #[test]
+    fn a_missing_program_is_an_error_not_a_panic() {
+        let mut command = Command::new("rvn-no-such-build-tool");
+        assert!(run_streamed(&mut command, std::io::sink).is_err());
+    }
 
     /// Creates empty files with the given names so artifact selection can be
     /// exercised without building anything.

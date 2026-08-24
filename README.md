@@ -46,6 +46,11 @@ two routinely differ.
 Before building, rvn offers to show you the PKGBUILD and any install scriptlet,
 since both are arbitrary code from a stranger. `-y` skips the prompt.
 
+While makepkg runs, its output is streamed straight through rather than held
+until the build ends — a compile that takes minutes should not be
+indistinguishable from a hang. The stage spinner steps aside for the duration
+and resumes once the build is done.
+
 #### Devel Packages
 
 A `-git` package's version is computed at build time, so it never changes on its
