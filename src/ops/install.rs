@@ -659,10 +659,51 @@ fn install_archives(
         let foreign = extract::owned_by_others(&ctx.local, Some(name.as_str()))
             .map_err(|e| format!("{name}: could not read the local database: {e}"))?;
 
-        let files = extract::unpack(path, &ctx.config.root_dir, &foreign, |_| {
-            progress.advance(1)
-        })
+        // Which backup files actually need protecting. One the user never
+        // touched -- on-disk bytes still matching the hash recorded when the
+        // previous version installed it -- follows the package across the
+        // upgrade like any other file. Everything else keeps its disk copy,
+        // with the package's version written alongside as `.pacnew`.
+        let previous_backup: &[BackupFile] = ctx
+            .local
+            .get(name)
+            .map(|p| p.backup.as_slice())
+            .unwrap_or(&[]);
+        let protected: Vec<String> = manifest
+            .backup
+            .iter()
+            .filter(|rel| {
+                let disk = ctx.config.root_dir.join(rel.as_str());
+                if !disk.is_file() {
+                    return false;
+                }
+                let pristine = previous_backup
+                    .iter()
+                    .find(|b| b.path == **rel)
+                    .and_then(|b| b.hash.as_deref())
+                    .zip(crate::verify::sha256_file(&disk).ok())
+                    .is_some_and(|(recorded, current)| recorded == current);
+                !pristine
+            })
+            .cloned()
+            .collect();
+
+        let mut pacnew = Vec::new();
+        let files = extract::unpack(
+            path,
+            &ctx.config.root_dir,
+            &foreign,
+            &protected,
+            &mut pacnew,
+            |_| progress.advance(1),
+        )
         .map_err(|e| format!("{name}: {e}"))?;
+
+        for rel in &pacnew {
+            ctx.ui.warn(&format!(
+                "{rel} kept as-is; the package's version is at {rel}.pacnew"
+            ));
+        }
 
         removed_stale += prune_stale(ctx, &previous_files, &files, name);
 
@@ -705,6 +746,32 @@ fn install_archives(
             old_version.as_deref(),
         );
 
+        // The part of installation Arch delegates to systemd and Raven must
+        // therefore do itself: create the accounts the package's sysusers.d
+        // fragment declares, and seed /etc from its tmpfiles.d factory
+        // copies. Without this, a daemon installs cleanly and then dies on
+        // its missing user or missing config -- and the fix lands on the
+        // operator, who was promised the installation would do it.
+        let mut warnings = Vec::new();
+        let applied = crate::hooks::apply(&ctx.config.root_dir, &files, &mut |w| {
+            warnings.push(w.to_string())
+        });
+        for warning in &warnings {
+            ctx.ui.warn(warning);
+        }
+        if !applied.users.is_empty() {
+            ctx.ui
+                .info(&format!("created system user{}: {}",
+                    if applied.users.len() == 1 { "" } else { "s" },
+                    applied.users.join(", ")));
+        }
+        if !applied.copied.is_empty() {
+            ctx.ui.info(&format!(
+                "seeded default config: {}",
+                applied.copied.join(", ")
+            ));
+        }
+
         installed_names.push(name.clone());
     }
 
@@ -714,7 +781,78 @@ fn install_archives(
         if installed_names.len() == 1 { "" } else { "s" }
     ));
 
+    activate_service_templates(ctx);
+
     Ok((installed_names, removed_stale))
+}
+
+/// Copies newly-satisfied service templates into raven-init's drop-in dir.
+///
+/// The base image ships no daemons, only inert templates under
+/// /usr/share/raven/services -- each a raven-init `[[services]]` definition
+/// for software `rvn install` may bring in later. Once the binary a template
+/// names exists, the definition is copied into /etc/raven/init.d so
+/// `raven-rc start <name>` works immediately. Templates ship with
+/// `enabled = false`: installing a daemon must not opt the machine into
+/// running it at every boot; `raven-rc enable` is that decision.
+///
+/// An existing drop-in of the same filename is never touched -- it may carry
+/// the operator's edits.
+fn activate_service_templates(ctx: &Context) {
+    let templates = ctx.config.root_dir.join("usr/share/raven/services");
+    let dropins = ctx.config.root_dir.join("etc/raven/init.d");
+
+    let Ok(entries) = std::fs::read_dir(&templates) else {
+        return;
+    };
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "toml") {
+            continue;
+        }
+        if dropins.join(entry.file_name()).exists() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+
+        // A full TOML parser for two fields would be a dependency for nothing:
+        // the templates are Raven's own files with a known shape.
+        let field = |key: &str| {
+            text.lines().map(str::trim).find_map(|l| {
+                l.strip_prefix(key)?
+                    .trim_start()
+                    .strip_prefix('=')?
+                    .trim()
+                    .strip_prefix('"')?
+                    .strip_suffix('"')
+                    .map(str::to_string)
+            })
+        };
+        let (Some(name), Some(exec)) = (field("name"), field("exec")) else {
+            continue;
+        };
+        if !ctx
+            .config
+            .root_dir
+            .join(exec.trim_start_matches('/'))
+            .exists()
+        {
+            continue;
+        }
+
+        if std::fs::create_dir_all(&dropins).is_err() {
+            return;
+        }
+        if std::fs::copy(&path, dropins.join(entry.file_name())).is_ok() {
+            ctx.ui.info(&format!(
+                "service '{name}' is now available: `raven-rc start {name}` \
+                 (enable at boot with `raven-rc enable {name}`)"
+            ));
+        }
+    }
 }
 
 /// Reports anything that makes the plan unusable.

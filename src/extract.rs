@@ -204,6 +204,15 @@ fn describe_wanted(entry: &ManifestEntry) -> String {
     }
 }
 
+/// Whether two files hold identical bytes. Config files are small, so a
+/// straight read costs less than being clever.
+fn same_bytes(a: &Path, b: &Path) -> bool {
+    match (std::fs::read(a), std::fs::read(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 fn is_metadata(path: &Path) -> bool {
     path.components().count() == 1
         && path
@@ -630,10 +639,12 @@ pub fn unpack(
     archive_path: &Path,
     root: &Path,
     foreign: &HashMap<String, String>,
+    backup: &[String],
+    pacnew: &mut Vec<String>,
     on_file: impl FnMut(&str),
 ) -> Result<Vec<String>, ExtractError> {
     let mut created = Vec::new();
-    match extract_entries(archive_path, root, &mut created, on_file) {
+    match extract_entries(archive_path, root, backup, pacnew, &mut created, on_file) {
         Ok(installed) => Ok(installed),
         Err(err) => {
             roll_back(created, foreign);
@@ -733,9 +744,12 @@ fn create_dirs(path: &Path, root: &Path, created: &mut Vec<Created>) -> Result<(
 fn extract_entries(
     archive_path: &Path,
     root: &Path,
+    backup: &[String],
+    pacnew: &mut Vec<String>,
     created: &mut Vec<Created>,
     mut on_file: impl FnMut(&str),
 ) -> Result<Vec<String>, ExtractError> {
+    let backup: std::collections::HashSet<&str> = backup.iter().map(String::as_str).collect();
     let mut archive = tar::Archive::new(open_archive(archive_path)?);
     archive.set_overwrite(true);
     archive.set_preserve_permissions(true);
@@ -895,6 +909,54 @@ fn extract_entries(
                             .unwrap_or_else(|| "a directory".into()),
                     });
                 }
+
+                // A file the package lists as `backup` is configuration, and
+                // configuration on disk wins: the package's copy lands next to
+                // it as `.pacnew`, exactly as pacman does. Extracting over it
+                // is how installing Arch's `filesystem` package -- whose
+                // payload includes /etc/passwd, /etc/group and /etc/shadow,
+                // all marked backup -- replaced a live system's account
+                // database with the package's one-line default and deleted
+                // every user on the machine.
+                //
+                // The caller decides what is in `backup`: a file whose on-disk
+                // content is still the previous version's pristine copy is
+                // left out, so an untouched config file still follows the
+                // package across upgrades.
+                if backup.contains(as_string.as_str()) {
+                    let pacnew_path = destination.with_file_name(format!(
+                        "{}.pacnew",
+                        destination
+                            .file_name()
+                            .map(|n| n.to_string_lossy())
+                            .unwrap_or_default()
+                    ));
+                    let _ = std::fs::remove_file(&pacnew_path);
+                    entry
+                        .unpack(&pacnew_path)
+                        .map_err(io_error("writing", &pacnew_path))?;
+
+                    if same_bytes(&destination, &pacnew_path) {
+                        // Identical content: ownership transfers, the disk
+                        // file stays, and there is nothing to tell the user.
+                        let _ = std::fs::remove_file(&pacnew_path);
+                    } else {
+                        created.push(Created {
+                            absolute: pacnew_path.clone(),
+                            relative: format!("{as_string}.pacnew"),
+                            is_dir: false,
+                            replaced_empty_dir: false,
+                        });
+                        pacnew.push(as_string.clone());
+                    }
+
+                    // The package owns the path either way; only the bytes on
+                    // disk were spared.
+                    on_file(&as_string);
+                    installed.push(as_string);
+                    continue;
+                }
+
                 std::fs::remove_file(&destination).map_err(io_error("replacing", &destination))?;
             }
             entry
@@ -1108,7 +1170,7 @@ mod tests {
         let archive = write_tar("traversal-unpack", &tar);
         let root = temp_dir("traversal-unpack");
 
-        let err = unpack(&archive, &root, &unowned(), |_| {}).unwrap_err();
+        let err = unpack(&archive, &root, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap_err();
         assert!(matches!(err, ExtractError::UnsafePath(_)));
         // Nothing may have been written next to the root either.
         assert!(!root.parent().unwrap().join("escaped.txt").exists());
@@ -1135,7 +1197,7 @@ mod tests {
         let root = temp_dir("unpack");
 
         let mut seen = Vec::new();
-        let files = unpack(&archive, &root, &unowned(), |f| seen.push(f.to_string())).unwrap();
+        let files = unpack(&archive, &root, &unowned(), &[], &mut Vec::new(), |f| seen.push(f.to_string())).unwrap();
 
         assert_eq!(files.len(), 2);
         assert_eq!(seen.len(), 2);
@@ -1184,7 +1246,7 @@ mod tests {
         let archive = write_tar("hardlink", &builder.into_inner().unwrap());
         let root = temp_dir("hardlink");
 
-        let files = unpack(&archive, &root, &unowned(), |_| {}).unwrap();
+        let files = unpack(&archive, &root, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap();
         assert_eq!(files.len(), 2, "the link counts as an installed file");
 
         let linked = root.join("usr/share/zoneinfo/Accra");
@@ -1219,7 +1281,7 @@ mod tests {
 
         let archive = write_tar("mtime", &builder.into_inner().unwrap());
         let root = temp_dir("mtime");
-        unpack(&archive, &root, &unowned(), |_| {}).unwrap();
+        unpack(&archive, &root, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap();
 
         // The symlink's own timestamp, not its target's.
         let link_meta = std::fs::symlink_metadata(root.join("usr/lib/libfoo.so")).unwrap();
@@ -1247,7 +1309,7 @@ mod tests {
         let archive = write_tar("symlink", &builder.into_inner().unwrap());
         let root = temp_dir("symlink");
 
-        let files = unpack(&archive, &root, &unowned(), |_| {}).unwrap();
+        let files = unpack(&archive, &root, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap();
         assert_eq!(files, vec!["usr/bin/sh"]);
 
         let link = root.join("usr/bin/sh");
@@ -1282,7 +1344,7 @@ mod tests {
         std::fs::create_dir_all(root.join("bin")).unwrap();
         std::fs::write(root.join("bin/sh"), b"#!").unwrap();
 
-        let error = unpack(&archive, &root, &unowned(), |_| {}).unwrap_err();
+        let error = unpack(&archive, &root, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap_err();
         assert!(
             matches!(&error, ExtractError::TypeConflict { path, .. } if path == "bin"),
             "got {error:?}"
@@ -1340,7 +1402,7 @@ mod tests {
         let archive = write_tar("hardlink-escape", &builder.into_inner().unwrap());
         let root = temp_dir("hardlink-escape");
 
-        let err = unpack(&archive, &root, &unowned(), |_| {}).unwrap_err();
+        let err = unpack(&archive, &root, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap_err();
         assert!(matches!(err, ExtractError::UnsafePath(_)));
     }
 
@@ -1439,7 +1501,7 @@ mod tests {
         let archive = write_tar("dirs", &tar);
         let root = temp_dir("dirs");
 
-        let files = unpack(&archive, &root, &unowned(), |_| {}).unwrap();
+        let files = unpack(&archive, &root, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap();
         assert!(files.contains(&"usr/".to_string()));
         assert!(files.contains(&"usr/bin/".to_string()));
         assert!(files.contains(&"usr/bin/demo".to_string()));
@@ -1492,7 +1554,7 @@ mod tests {
             assert_eq!(m.files, vec!["usr/bin/demo"], "format {ext}");
 
             let root = temp_dir(&format!("fmt-{ext}"));
-            let files = unpack(&path, &root, &unowned(), |_| {}).unwrap();
+            let files = unpack(&path, &root, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap();
             assert_eq!(files, vec!["usr/bin/demo"], "format {ext}");
             assert!(root.join("usr/bin/demo").exists(), "format {ext}");
         }
@@ -1622,7 +1684,7 @@ mod tests {
         std::fs::create_dir_all(empty.join("bin")).unwrap();
         assert!(find_conflicts(&m, &local, &empty, None).unwrap().is_empty());
         // ...and extraction agrees, rather than skipping the entry.
-        unpack(&archive, &empty, &unowned(), |_| {}).unwrap();
+        unpack(&archive, &empty, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap();
         assert_eq!(
             std::fs::read_link(empty.join("bin")).unwrap(),
             PathBuf::from("usr/bin")
@@ -1650,11 +1712,11 @@ mod tests {
         let archive = write_tar("idempotent", &builder.into_inner().unwrap());
         let root = temp_dir("idempotent");
 
-        let first = unpack(&archive, &root, &unowned(), |_| {}).unwrap();
+        let first = unpack(&archive, &root, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap();
         let link = root.join("usr/lib/libfoo.so");
         let inode = std::fs::symlink_metadata(&link).unwrap().ino();
 
-        let second = unpack(&archive, &root, &unowned(), |_| {}).unwrap();
+        let second = unpack(&archive, &root, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap();
 
         // The same file list, so the local database records the same package.
         assert_eq!(first, second);
@@ -1686,7 +1748,7 @@ mod tests {
         std::fs::create_dir_all(root.join("usr/share/doc")).unwrap();
         std::fs::write(root.join("usr/share/doc/README"), b"docs").unwrap();
 
-        let err = unpack(&archive, &root, &unowned(), |_| {}).unwrap_err();
+        let err = unpack(&archive, &root, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap_err();
         assert!(matches!(err, ExtractError::TypeConflict { .. }), "got {err:?}");
 
         // What this run wrote is gone, directories included.
@@ -1759,7 +1821,7 @@ mod tests {
         std::os::unix::fs::symlink("nowhere", dangling.join("usr")).unwrap();
         let archive = write_tar("io-context-dangling", &build_tar(&[("usr/", "", true)]));
 
-        let err = unpack(&archive, &dangling, &unowned(), |_| {}).unwrap_err();
+        let err = unpack(&archive, &dangling, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap_err();
         let message = err.to_string();
         assert!(matches!(err, ExtractError::IoAt { .. }), "got {err:?}");
         assert!(message.starts_with("creating directory "), "{message}");
@@ -1770,7 +1832,7 @@ mod tests {
         std::fs::write(blocked.join("usr"), b"not a directory").unwrap();
         let archive = write_tar("io-context-file", &build_tar(&[("usr/bin/demo", "x", false)]));
 
-        let err = unpack(&archive, &blocked, &unowned(), |_| {}).unwrap_err();
+        let err = unpack(&archive, &blocked, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap_err();
         let message = err.to_string();
         assert!(message.starts_with("creating directory "), "{message}");
         assert!(message.contains("/usr/bin:"), "{message}");
@@ -1832,7 +1894,7 @@ mod tests {
         let old = FileTime::from_unix_time(315_532_800, 0);
         filetime::set_symlink_file_times(root.join("usr/lib/libfoo.so"), old, old).unwrap();
 
-        unpack(&archive, &root, &unowned(), |_| {}).unwrap();
+        unpack(&archive, &root, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap();
 
         let meta = std::fs::symlink_metadata(root.join("usr/lib/libfoo.so")).unwrap();
         let got = FileTime::from_last_modification_time(&meta).unix_seconds();
@@ -1859,7 +1921,7 @@ mod tests {
         std::fs::create_dir_all(root.join("usr/share/doc")).unwrap();
         std::fs::write(root.join("usr/share/doc/README"), b"docs").unwrap();
 
-        unpack(&archive, &root, &unowned(), |_| {}).unwrap_err();
+        unpack(&archive, &root, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap_err();
 
         let meta = std::fs::symlink_metadata(root.join("bin")).unwrap();
         assert!(
@@ -1973,6 +2035,109 @@ mod tests {
         let local = LocalDb::load(&temp_dir("direntry-db"));
         let problems = find_conflicts(&manifest, &local, &root, None).unwrap();
         assert!(!problems.is_empty(), "a directory over a file must be caught");
+    }
+
+
+    /// The incident this guards: Arch's `filesystem` package ships /etc/passwd
+    /// (one root line) marked `backup`, and rvn extracted straight over the
+    /// live file -- deleting every account on the machine. sudo, su, ssh and
+    /// dbus all died within a minute of `rvn install openssh` succeeding.
+    #[test]
+    fn a_backup_file_on_disk_survives_and_the_package_copy_lands_as_pacnew() {
+        let tar = build_tar(&[("etc/passwd", "root:x:0:0::/root:/usr/bin/bash\n", false)]);
+        let path = write_tar("backup-clobber", &tar);
+        let root = temp_dir("backup-clobber");
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        let live = "root:x:0:0:root:/root:/bin/bash\njavanstorm:x:1000:1000::/home/javanstorm:/bin/bash\n";
+        std::fs::write(root.join("etc/passwd"), live).unwrap();
+
+        let mut pacnew = Vec::new();
+        let files = unpack(
+            &path,
+            &root,
+            &unowned(),
+            &["etc/passwd".to_string()],
+            &mut pacnew,
+            |_| {},
+        )
+        .unwrap();
+
+        // The machine's accounts are untouched...
+        assert_eq!(
+            std::fs::read_to_string(root.join("etc/passwd")).unwrap(),
+            live,
+            "a backup file must never be overwritten"
+        );
+        // ...the package's copy is inspectable next to it...
+        assert_eq!(
+            std::fs::read_to_string(root.join("etc/passwd.pacnew")).unwrap(),
+            "root:x:0:0::/root:/usr/bin/bash\n"
+        );
+        // ...the caller is told...
+        assert_eq!(pacnew, vec!["etc/passwd".to_string()]);
+        // ...and the package still owns the path.
+        assert!(files.contains(&"etc/passwd".to_string()));
+    }
+
+    /// Identical content is not a conflict: ownership transfers quietly and no
+    /// .pacnew clutter is left behind.
+    #[test]
+    fn an_identical_backup_file_produces_no_pacnew() {
+        let tar = build_tar(&[("etc/hosts", "127.0.0.1 localhost\n", false)]);
+        let path = write_tar("backup-same", &tar);
+        let root = temp_dir("backup-same");
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/hosts"), "127.0.0.1 localhost\n").unwrap();
+
+        let mut pacnew = Vec::new();
+        unpack(&path, &root, &unowned(), &["etc/hosts".to_string()], &mut pacnew, |_| {}).unwrap();
+
+        assert!(pacnew.is_empty());
+        assert!(!root.join("etc/hosts.pacnew").exists());
+    }
+
+    /// A backup file with nothing on disk installs like any other file.
+    #[test]
+    fn an_absent_backup_file_is_extracted_normally() {
+        let tar = build_tar(&[("etc/fstab", "# fstab\n", false)]);
+        let path = write_tar("backup-absent", &tar);
+        let root = temp_dir("backup-absent");
+
+        let mut pacnew = Vec::new();
+        unpack(&path, &root, &unowned(), &["etc/fstab".to_string()], &mut pacnew, |_| {}).unwrap();
+
+        assert_eq!(std::fs::read_to_string(root.join("etc/fstab")).unwrap(), "# fstab\n");
+        assert!(pacnew.is_empty());
+    }
+
+    /// The .pacnew this run wrote is part of the transaction: a failure takes
+    /// it back out, while the protected disk file stays protected.
+    #[test]
+    fn a_failed_transaction_removes_its_pacnew_but_not_the_disk_file() {
+        let tar = build_tar(&[
+            ("etc/passwd", "root:x:0:0::/root:/usr/bin/bash\n", false),
+            // A file landing on a populated directory, which fails.
+            ("usr/share/doc", "boom", false),
+        ]);
+        let path = write_tar("backup-rollback", &tar);
+        let root = temp_dir("backup-rollback");
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/passwd"), "root:x:0:0:root:/root:/bin/bash\n").unwrap();
+        std::fs::create_dir_all(root.join("usr/share/doc")).unwrap();
+        std::fs::write(root.join("usr/share/doc/README"), "x").unwrap();
+
+        let mut pacnew = Vec::new();
+        unpack(&path, &root, &unowned(), &["etc/passwd".to_string()], &mut pacnew, |_| {})
+            .unwrap_err();
+
+        assert!(
+            !root.join("etc/passwd.pacnew").exists(),
+            "the rollback must take the pacnew with it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("etc/passwd")).unwrap(),
+            "root:x:0:0:root:/root:/bin/bash\n"
+        );
     }
 
 }

@@ -4,6 +4,7 @@ pub mod db;
 pub mod devel;
 pub mod extract;
 pub mod fetch;
+pub mod hooks;
 pub mod ops;
 pub mod pkg;
 pub mod remove;
