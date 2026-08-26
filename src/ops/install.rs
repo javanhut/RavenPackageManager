@@ -593,13 +593,31 @@ fn install_archives(
     for (name, path) in archives {
         let manifest = extract::manifest(path).map_err(|e| format!("{name}: {e}"))?;
         let upgrading = ctx.local.get(name).map(|_| name.as_str());
-        let conflicts = extract::find_conflicts(&manifest, &ctx.local, upgrading)
-            .map_err(|e| format!("{name}: could not check for file conflicts: {e}"))?;
+        let conflicts =
+            extract::find_conflicts(&manifest, &ctx.local, &ctx.config.root_dir, upgrading)
+                .map_err(|e| format!("{name}: could not check for file conflicts: {e}"))?;
         if !conflicts.is_empty() {
             spinner.fail("file conflicts detected");
-            let lines: Vec<String> = conflicts.iter().map(|c| c.to_string()).collect();
+            let mut lines: Vec<String> = conflicts.iter().map(|c| c.to_string()).collect();
+            // A type conflict on the layout paths is not a packaging mistake,
+            // it is a root that was never usr-merged: Arch ships /bin, /lib,
+            // /lib64 and /sbin as symlinks into /usr, and a split-usr root has
+            // them as real directories. Saying so beats leaving the reader to
+            // work out what to do with "bin would be a symlink to usr/bin".
+            if conflicts
+                .iter()
+                .any(|c| matches!(c, extract::ExtractError::TypeConflict { .. }))
+            {
+                lines.push(
+                    "this root is not usr-merged; convert it with \
+                     scripts/usrmerge-rootfs.sh, then retry"
+                        .to_string(),
+                );
+            }
             ctx.ui.tree(&lines);
-            return Err(format!("{name} conflicts with installed files"));
+            // Not "installed files": a type conflict is about what is on disk,
+            // which may be owned by no package at all.
+            return Err(format!("{name} conflicts with what is already on disk"));
         }
         manifests.push((name.clone(), path.clone(), manifest));
     }
@@ -635,8 +653,16 @@ fn install_archives(
             old_version.as_deref(),
         );
 
-        let files = extract::unpack(path, &ctx.config.root_dir, |_| progress.advance(1))
-            .map_err(|e| format!("{name}: {e}"))?;
+        // Needed before unpacking, not after: if extraction fails part-way it
+        // rolls back what it wrote, and must know which paths belong to
+        // another package so it leaves those alone.
+        let foreign = extract::owned_by_others(&ctx.local, Some(name.as_str()))
+            .map_err(|e| format!("{name}: could not read the local database: {e}"))?;
+
+        let files = extract::unpack(path, &ctx.config.root_dir, &foreign, |_| {
+            progress.advance(1)
+        })
+        .map_err(|e| format!("{name}: {e}"))?;
 
         removed_stale += prune_stale(ctx, &previous_files, &files, name);
 

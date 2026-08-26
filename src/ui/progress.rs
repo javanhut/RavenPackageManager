@@ -40,6 +40,13 @@ pub struct Progress {
     /// Extra context shown after the rate, e.g. `3/12 packages`.
     detail: String,
     unit: Unit,
+    /// Set by `finish`, so the `Drop` guard knows the line has already been
+    /// settled and must not be wiped.
+    finished: bool,
+    /// How many times the bar has actually been written. Only tests read it,
+    /// to assert that a detail change repaints rather than waiting for the
+    /// next `advance` -- the difference is invisible from the rendered line.
+    paints: u64,
 }
 
 impl Progress {
@@ -58,11 +65,23 @@ impl Progress {
             last_paint: Instant::now() - Duration::from_secs(1),
             detail: String::new(),
             unit,
+            finished: false,
+            paints: 0,
         }
     }
 
+    /// Changes the trailing context, repainting immediately.
+    ///
+    /// The repaint deliberately bypasses the frame throttle. Detail changes
+    /// once per package rather than per file, so it costs nothing -- and
+    /// leaving it for the next `advance` means a package that fails before
+    /// its first file is still labelled with the *previous* package's name.
     pub fn set_detail(&mut self, detail: &str) {
+        if self.detail == detail {
+            return;
+        }
         self.detail = detail.to_string();
+        self.paint();
     }
 
     /// Records absolute progress and repaints if enough time has passed.
@@ -106,13 +125,19 @@ impl Progress {
     }
 
     fn maybe_paint(&mut self) {
-        if !self.style.interactive {
-            return;
-        }
         // ~20fps is smooth without burning cycles on escape sequences.
         if self.last_paint.elapsed() < Duration::from_millis(50) && self.done < self.total {
             return;
         }
+        self.paint();
+    }
+
+    /// Repaints now, ignoring the frame throttle.
+    fn paint(&mut self) {
+        if !self.style.interactive {
+            return;
+        }
+        self.paints += 1;
         self.last_paint = Instant::now();
         let line = self.render();
         let mut err = std::io::stderr();
@@ -162,8 +187,14 @@ impl Progress {
         line
     }
 
+    /// Whether dropping now would leave a half-drawn bar on screen.
+    fn needs_clear(&self) -> bool {
+        !self.finished && self.style.interactive
+    }
+
     /// Clears the bar and prints a settled summary line.
-    pub fn finish(self, message: &str) {
+    pub fn finish(mut self, message: &str) {
+        self.finished = true;
         let mut err = std::io::stderr();
         if self.style.interactive {
             let _ = write!(err, "\r\x1b[2K");
@@ -178,12 +209,42 @@ impl Progress {
     }
 }
 
+/// Wipes an abandoned bar.
+///
+/// A transaction that fails mid-extraction drops its `Progress` without ever
+/// reaching `finish`, and the bar is only ever terminated by a carriage
+/// return -- so the error the caller prints next lands *on top of* it, which
+/// is how `installing 14% ... tzdata` and `error: filesystem: File exists`
+/// ended up sharing one line.
+impl Drop for Progress {
+    fn drop(&mut self) {
+        if !self.needs_clear() {
+            return;
+        }
+        let mut err = std::io::stderr();
+        let _ = write!(err, "\r\x1b[2K");
+        let _ = err.flush();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn progress(total: u64) -> Progress {
         Progress::new(Style::plain(), "fetching", total)
+    }
+
+    /// A style that claims a terminal, so painting is not short-circuited.
+    fn interactive() -> Style {
+        Style {
+            interactive: true,
+            ..Style::plain()
+        }
+    }
+
+    fn installing(total: u64) -> Progress {
+        Progress::with_unit(interactive(), "installing", total, Unit::Count("files"))
     }
 
     #[test]
@@ -257,6 +318,44 @@ mod tests {
         // Rewinding past zero must not underflow.
         p.rewind(999_999);
         assert_eq!(p.fraction(), 0.0);
+    }
+
+    /// The bug this guards: `installing ... tzdata` stayed on screen while the
+    /// failure came from `filesystem`. The package label had been set, but
+    /// nothing repainted, because the package died before its first file and
+    /// so never called `advance`.
+    #[test]
+    fn changing_the_detail_repaints_immediately() {
+        let mut p = installing(100);
+        p.set_detail("tzdata");
+        p.advance(10);
+        let before = p.paints;
+
+        p.set_detail("filesystem");
+        assert_eq!(p.paints, before + 1, "a new package label must repaint");
+        assert!(p.render().contains("filesystem"));
+        assert!(!p.render().contains("tzdata"));
+    }
+
+    #[test]
+    fn repeating_the_same_detail_does_not_repaint() {
+        let mut p = installing(100);
+        p.set_detail("filesystem");
+        let after_first = p.paints;
+        p.set_detail("filesystem");
+        assert_eq!(p.paints, after_first);
+    }
+
+    /// A transaction that fails mid-extraction drops the bar without calling
+    /// `finish`; the line must be wiped or the error prints on top of it.
+    #[test]
+    fn an_abandoned_bar_is_cleared_and_a_finished_one_is_not() {
+        let mut p = installing(100);
+        p.advance(10);
+        assert!(p.needs_clear());
+
+        p.finished = true;
+        assert!(!p.needs_clear());
     }
 
     #[test]
