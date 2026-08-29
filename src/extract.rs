@@ -98,6 +98,9 @@ impl From<io::Error> for ExtractError {
     }
 }
 
+/// Largest zstd window the spec permits (2^31 bytes).
+const ZSTD_MAX_WINDOW_SIZE: u64 = 1 << 31;
+
 /// Opens a package archive, transparently handling zstd, gzip, xz-less plain
 /// tar, based on the file extension.
 fn open_archive(path: &Path) -> Result<Box<dyn Read>, ExtractError> {
@@ -108,7 +111,11 @@ fn open_archive(path: &Path) -> Result<Box<dyn Read>, ExtractError> {
     // Arch has moved to zstd, but xz is still what Arch Linux ARM ships and
     // what older packages in every repository use.
     if name.ends_with(".zst") || name.ends_with(".zstd") {
-        let decoder = StreamingDecoder::new(reader)
+        // ruzstd defaults to a 100 MB window cap. makepkg compresses large
+        // packages (rust, llvm, cuda, ...) with `zstd --long`, which requests a
+        // 128 MiB window and trips that cap. Packages are signature-verified
+        // before extraction, so allow the full zstd spec maximum.
+        let decoder = StreamingDecoder::new_with_max_window_size(reader, ZSTD_MAX_WINDOW_SIZE)
             .map_err(|e| ExtractError::UnsupportedFormat(e.to_string()))?;
         Ok(Box::new(decoder))
     } else if name.ends_with(".xz") || name.ends_with(".lzma") {
