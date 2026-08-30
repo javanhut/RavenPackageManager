@@ -895,6 +895,12 @@ fn report_problems(ctx: &Context, plan: &Plan) -> Result<(), String> {
             })
             .collect();
         ctx.ui.tree(&lines);
+        if !ctx.config.repos.iter().any(|r| r.name == "multilib") {
+            ctx.ui.warn(
+                "the multilib repository is not enabled in pacman.conf — \
+                 steam, wine and every lib32-* package live only there",
+            );
+        }
         return Err("could not satisfy every dependency".into());
     }
 
