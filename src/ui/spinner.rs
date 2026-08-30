@@ -51,8 +51,12 @@ impl Spinner {
         // Non-interactive output gets a single static line instead of an
         // animation, so logs and CI transcripts stay readable.
         if !style.interactive {
-            let mut err = std::io::stderr();
-            let _ = writeln!(err, "  {} {}", style.glyphs.bullet, message);
+            if style.json {
+                super::json::emit("stage", serde_json::json!({ "message": message }));
+            } else {
+                let mut err = std::io::stderr();
+                let _ = writeln!(err, "  {} {}", style.glyphs.bullet, message);
+            }
             return Spinner {
                 shared,
                 handle: Mutex::new(None),
@@ -127,7 +131,9 @@ impl Spinner {
         if let Ok(mut current) = self.shared.message.lock() {
             *current = message.to_string();
         }
-        if !self.style.interactive {
+        if self.style.json {
+            super::json::emit("stage", serde_json::json!({ "message": message }));
+        } else if !self.style.interactive {
             let mut err = std::io::stderr();
             let _ = writeln!(err, "  {} {}", self.style.glyphs.bullet, message);
         }
@@ -164,6 +170,12 @@ impl Spinner {
     /// further output can race the animation thread.
     pub fn succeed(self, message: &str) {
         self.stop();
+        if self.style.json {
+            return super::json::emit(
+                "stage_done",
+                serde_json::json!({ "message": message, "ok": true, "ms": self.started.elapsed().as_millis() as u64 }),
+            );
+        }
         let glyph = self.style.paint(Color::Green, self.style.glyphs.ok);
         let took = self.style.dim(&format!("({})", super::theme::duration(self.started.elapsed())));
         let mut err = std::io::stderr();
@@ -173,6 +185,12 @@ impl Spinner {
     /// Settles the line with a failure mark.
     pub fn fail(self, message: &str) {
         self.stop();
+        if self.style.json {
+            return super::json::emit(
+                "stage_done",
+                serde_json::json!({ "message": message, "ok": false, "ms": self.started.elapsed().as_millis() as u64 }),
+            );
+        }
         let glyph = self.style.paint(Color::Red, self.style.glyphs.fail);
         let mut err = std::io::stderr();
         let _ = writeln!(err, "  {glyph}  {message}");
@@ -219,6 +237,7 @@ mod tests {
             unicode: false,
             interactive: true,
             glyphs: super::super::theme::ASCII,
+            json: false,
         }
     }
 

@@ -592,9 +592,18 @@ fn install_archives(
 
     for (name, path) in archives {
         let manifest = extract::manifest(path).map_err(|e| format!("{name}: {e}"))?;
-        let upgrading = ctx.local.get(name).map(|_| name.as_str());
+        // Files owned by the version being upgraded are not in the way, and
+        // neither are files owned by a package this one replaces: those are
+        // handed over, and their old owner is retired once this one is in.
+        let mut exempt: Vec<&str> = ctx.local.get(name).map(|_| name.as_str()).into_iter().collect();
+        exempt.extend(
+            plan.replacing
+                .iter()
+                .filter(|(new, _)| new == name)
+                .map(|(_, old)| old.as_str()),
+        );
         let conflicts =
-            extract::find_conflicts(&manifest, &ctx.local, &ctx.config.root_dir, upgrading)
+            extract::find_conflicts(&manifest, &ctx.local, &ctx.config.root_dir, &exempt)
                 .map_err(|e| format!("{name}: could not check for file conflicts: {e}"))?;
         if !conflicts.is_empty() {
             spinner.fail("file conflicts detected");
@@ -656,7 +665,7 @@ fn install_archives(
         // Needed before unpacking, not after: if extraction fails part-way it
         // rolls back what it wrote, and must know which paths belong to
         // another package so it leaves those alone.
-        let foreign = extract::owned_by_others(&ctx.local, Some(name.as_str()))
+        let foreign = extract::owned_by_others(&ctx.local, &[name.as_str()])
             .map_err(|e| format!("{name}: could not read the local database: {e}"))?;
 
         // Which backup files actually need protecting. One the user never
@@ -895,6 +904,32 @@ fn report_problems(ctx: &Context, plan: &Plan) -> Result<(), String> {
 /// Prints the transaction summary the user is about to approve.
 fn show_plan(ctx: &Context, plan: &Plan) {
     let s = &ctx.ui.style;
+
+    if ctx.ui.is_json() {
+        // A front-end wants the plan as data, not as painted lines.
+        let entries: Vec<serde_json::Value> = plan
+            .install
+            .iter()
+            .map(|r| {
+                let mut v = crate::ui::json::package(&r.package);
+                v["explicit"] = serde_json::Value::Bool(r.reason.is_explicit());
+                v["installed_version"] = serde_json::json!(r.replaces_version);
+                v
+            })
+            .collect();
+        ctx.ui.emit(
+            "plan",
+            serde_json::json!({
+                "install": entries,
+                "replacing": plan.replacing.iter().map(|(new, old)| serde_json::json!({ "new": new, "old": old })).collect::<Vec<_>>(),
+                "download_size": plan.download_size(),
+                "installed_size_delta": plan.installed_size_delta(),
+                "build_from_source": plan.aur_count(),
+            }),
+        );
+        return;
+    }
+
     ctx.ui.blank();
 
     let explicit: Vec<&Resolved> = plan.install.iter().filter(|r| r.reason.is_explicit()).collect();

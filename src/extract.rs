@@ -436,11 +436,11 @@ pub fn manifest(path: &Path) -> Result<Manifest, ExtractError> {
 /// its own files.
 pub fn owned_by_others(
     local: &LocalDb,
-    upgrading: Option<&str>,
+    exempt: &[&str],
 ) -> Result<HashMap<String, String>, ExtractError> {
     let mut owners: HashMap<String, String> = HashMap::new();
     for name in local.packages.keys() {
-        if Some(name.as_str()) == upgrading {
+        if exempt.contains(&name.as_str()) {
             continue;
         }
         // An unreadable file list must not be skipped: doing so would leave
@@ -463,15 +463,18 @@ pub fn owned_by_others(
 /// package behind. Arch's `filesystem` shipping /bin as a symlink onto a root
 /// whose /bin is a populated directory is the case that motivated it.
 ///
-/// A file owned by `upgrading` is not a conflict — that is just a version
-/// replacing itself.
+/// A file owned by anything in `exempt` is not a conflict. That is the
+/// package being upgraded — a version replacing itself — and every installed
+/// package the incoming one declares it `replaces`: `rust` taking over
+/// `usr/bin/cargo` from `rustup` is the rename working as intended, and the
+/// old owner is retired once the successor is on disk.
 pub fn find_conflicts(
     manifest: &Manifest,
     local: &LocalDb,
     root: &Path,
-    upgrading: Option<&str>,
+    exempt: &[&str],
 ) -> Result<Vec<ExtractError>, ExtractError> {
-    let owners = owned_by_others(local, upgrading)?;
+    let owners = owned_by_others(local, exempt)?;
 
     let mut problems: Vec<ExtractError> = manifest
         .files
@@ -484,14 +487,14 @@ pub fn find_conflicts(
         })
         .collect();
 
-    // What the package being upgraded already owns. A version that turns one
-    // of its own directories into a symlink is doing an ordinary upstream
-    // migration on its own files, and refusing that would abort every
-    // `rvn -Syu` that contained one.
-    let mine: std::collections::HashSet<String> = match upgrading {
-        Some(name) => local.files_or_empty(name)?.into_iter().collect(),
-        None => std::collections::HashSet::new(),
-    };
+    // What the package being upgraded (or the ones being replaced) already
+    // owns. A version that turns one of its own directories into a symlink is
+    // doing an ordinary upstream migration on its own files, and refusing
+    // that would abort every `rvn -Syu` that contained one.
+    let mut mine: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for name in exempt {
+        mine.extend(local.files_or_empty(name)?);
+    }
     let owned_by_upgrading = |relative: &str| {
         let bare = relative.trim_end_matches('/');
         mine.contains(bare) || mine.contains(&format!("{bare}/"))
@@ -1384,7 +1387,7 @@ mod tests {
 
         let manifest = manifest(&archive).unwrap();
         let local = LocalDb::default();
-        let problems = find_conflicts(&manifest, &local, &root, None).unwrap();
+        let problems = find_conflicts(&manifest, &local, &root, &[]).unwrap();
 
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(
@@ -1657,7 +1660,7 @@ mod tests {
 
         let local = LocalDb::load(&temp_dir("type-conflict-db"));
         let m = manifest(&archive).unwrap();
-        let conflicts = find_conflicts(&m, &local, &root, None).unwrap();
+        let conflicts = find_conflicts(&m, &local, &root, &[]).unwrap();
 
         assert_eq!(conflicts.len(), 1, "got {conflicts:?}");
         assert!(matches!(conflicts[0], ExtractError::TypeConflict { .. }));
@@ -1684,12 +1687,12 @@ mod tests {
         let merged = temp_dir("no-type-conflict-merged");
         std::fs::create_dir_all(merged.join("usr/bin")).unwrap();
         std::os::unix::fs::symlink("usr/bin", merged.join("bin")).unwrap();
-        assert!(find_conflicts(&m, &local, &merged, None).unwrap().is_empty());
+        assert!(find_conflicts(&m, &local, &merged, &[]).unwrap().is_empty());
 
         // An empty directory has nothing to lose, so the link may replace it.
         let empty = temp_dir("no-type-conflict-empty");
         std::fs::create_dir_all(empty.join("bin")).unwrap();
-        assert!(find_conflicts(&m, &local, &empty, None).unwrap().is_empty());
+        assert!(find_conflicts(&m, &local, &empty, &[]).unwrap().is_empty());
         // ...and extraction agrees, rather than skipping the entry.
         unpack(&archive, &empty, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap();
         assert_eq!(
@@ -1863,13 +1866,60 @@ mod tests {
         };
 
         let install_root = temp_dir("conflicts-root");
-        let conflicts = find_conflicts(&manifest, &local, &install_root, None).unwrap();
+        let conflicts = find_conflicts(&manifest, &local, &install_root, &[]).unwrap();
         assert_eq!(conflicts.len(), 1);
         assert!(conflicts[0].to_string().contains("owned by other"));
 
         // Upgrading the owning package is not a conflict with itself.
-        let none = find_conflicts(&manifest, &local, &install_root, Some("other")).unwrap();
+        let none = find_conflicts(&manifest, &local, &install_root, &["other"]).unwrap();
         assert!(none.is_empty());
+    }
+
+    /// `rust` replacing `rustup`: the successor ships the very files the
+    /// package it retires still owns. Those are handed over, not fought over,
+    /// while a third package's files stay protected.
+    #[test]
+    fn files_owned_by_a_replaced_package_are_not_a_conflict() {
+        let root = temp_dir("replaced-db");
+        let mut local = LocalDb::load(&root);
+
+        let rustup = crate::pkg::Package {
+            name: "rustup".into(),
+            version: "1.29.0-2".into(),
+            ..Default::default()
+        };
+        local
+            .register(&rustup, &["usr/bin/cargo".into(), "usr/bin/rustc".into()])
+            .unwrap();
+        let other = crate::pkg::Package {
+            name: "other".into(),
+            version: "1.0-1".into(),
+            ..Default::default()
+        };
+        local.register(&other, &["usr/bin/demo".into()]).unwrap();
+
+        let manifest = Manifest {
+            files: vec!["usr/bin/cargo".into(), "usr/bin/rustc".into()],
+            ..Default::default()
+        };
+        let install_root = temp_dir("replaced-root");
+
+        // Without the replacement declared, rustup's files are in the way.
+        let conflicts = find_conflicts(&manifest, &local, &install_root, &[]).unwrap();
+        assert_eq!(conflicts.len(), 2);
+
+        // With it, rust takes them over cleanly.
+        let none = find_conflicts(&manifest, &local, &install_root, &["rustup"]).unwrap();
+        assert!(none.is_empty(), "{none:?}");
+
+        // Exempting rustup does not loosen the check for anyone else.
+        let manifest = Manifest {
+            files: vec!["usr/bin/cargo".into(), "usr/bin/demo".into()],
+            ..Default::default()
+        };
+        let still = find_conflicts(&manifest, &local, &install_root, &["rustup"]).unwrap();
+        assert_eq!(still.len(), 1);
+        assert!(still[0].to_string().contains("owned by other"));
     }
 
     /// A symlink builder that can stamp an mtime, for the timestamp cases.
@@ -1958,7 +2008,7 @@ mod tests {
         local.register(&other, &["var/empty/".into()]).unwrap();
 
         let manifest = manifest(&archive).unwrap();
-        let problems = find_conflicts(&manifest, &local, &root, None).unwrap();
+        let problems = find_conflicts(&manifest, &local, &root, &[]).unwrap();
         assert!(
             matches!(&problems[..], [ExtractError::FileConflict { owner, .. }] if owner == "other"),
             "{problems:?}"
@@ -1990,11 +2040,11 @@ mod tests {
             .unwrap();
 
         let manifest = manifest(&archive).unwrap();
-        let problems = find_conflicts(&manifest, &local, &root, Some("foo")).unwrap();
+        let problems = find_conflicts(&manifest, &local, &root, &["foo"]).unwrap();
         assert!(problems.is_empty(), "{problems:?}");
 
         // ...and someone else's directory of the same shape still is one.
-        let problems = find_conflicts(&manifest, &local, &root, None).unwrap();
+        let problems = find_conflicts(&manifest, &local, &root, &[]).unwrap();
         assert_eq!(problems.len(), 1, "{problems:?}");
     }
 
@@ -2016,7 +2066,7 @@ mod tests {
 
         let manifest = manifest(&archive).unwrap();
         let local = LocalDb::load(&temp_dir("ancestor-db"));
-        let problems = find_conflicts(&manifest, &local, &root, None).unwrap();
+        let problems = find_conflicts(&manifest, &local, &root, &[]).unwrap();
         assert!(
             matches!(&problems[..], [ExtractError::TypeConflict { path, .. }] if path == "opt/thing"),
             "{problems:?}"
@@ -2040,7 +2090,7 @@ mod tests {
 
         let manifest = manifest(&archive).unwrap();
         let local = LocalDb::load(&temp_dir("direntry-db"));
-        let problems = find_conflicts(&manifest, &local, &root, None).unwrap();
+        let problems = find_conflicts(&manifest, &local, &root, &[]).unwrap();
         assert!(!problems.is_empty(), "a directory over a file must be caught");
     }
 

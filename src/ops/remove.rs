@@ -77,6 +77,14 @@ pub fn execute(
         });
     }
 
+    ctx.ui.emit(
+        "removal_plan",
+        serde_json::json!({
+            "remove": plan.remove.iter().map(crate::ui::json::package).collect::<Vec<_>>(),
+            "orphaned": plan.orphaned,
+            "cascaded": plan.cascaded,
+        }),
+    );
     show_plan(ctx, &plan);
 
     if ctx.dry_run {

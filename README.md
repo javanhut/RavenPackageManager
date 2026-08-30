@@ -364,6 +364,38 @@ for the next command to read.
 Neither Arch nor Arch Linux ARM currently publishes `.db.sig` files, which is why
 the shipped configuration uses `DatabaseOptional`.
 
+## Machine-Readable Output
+
+`--json` turns every line of interface output into a JSON event on stdout, one
+object per line, and suppresses the painted stderr interface. This is how
+[Raven Store](https://github.com/javanhut/RavenStore) drives rvn; anything else
+that wants structured data can read the same stream.
+
+```bash
+rvn --json find ripgrep --limit 5      # {"event":"results","query":"ripgrep","results":[…],"total":16}
+rvn --json list --explicit             # {"event":"installed","packages":[…]}
+rvn --json info ripgrep                # {"event":"packages","packages":[…],"missing":[]}
+rvn --json update --dry-run            # …{"event":"updates","candidates":[…],"download_size":…}
+sudo rvn --json -y install ripgrep     # a live stream: stage, progress, plan, ok/warn/err, done
+```
+
+| Event | Fields | When |
+| --- | --- | --- |
+| `banner` | `version` | An operation starts |
+| `stage` / `stage_done` | `message`; `ok`, `ms` | A spinner would start / settle |
+| `progress` / `progress_done` | `label`, `done`, `total`, `unit`, `detail` | A progress bar would repaint / finish |
+| `ok` `warn` `err` `info` `step` `detail` | `message` | A status line |
+| `tree` | `items` | An indented list |
+| `plan` | `install[]`, `replacing[]`, `download_size`, `installed_size_delta`, `build_from_source` | Install resolved a transaction |
+| `updates` | `candidates[]`, `downgrades[]`, `download_size` | Update worked out what is out of date |
+| `removal_plan` | `remove[]`, `orphaned[]`, `cascaded[]` | Uninstall planned a removal |
+| `results` / `installed` / `packages` | package objects | `find` / `list` / `info` |
+| `done` / `failed` | – / `message` | The command finished |
+
+JSON mode is never interactive: prompts take their defaults, so pair it with
+`-y` for anything that would otherwise ask. Raw output from `makepkg` and
+scriptlets still goes to stderr, where a front-end can show it as a log.
+
 ## Global Options
 
 rvn looks after its own housekeeping, so a normal install needs no flags at all:

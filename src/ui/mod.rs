@@ -3,6 +3,7 @@
 //! All interface output goes to stderr so that machine-readable results on
 //! stdout stay pipeable.
 
+pub mod json;
 pub mod progress;
 pub mod spinner;
 pub mod theme;
@@ -29,8 +30,35 @@ impl Ui {
         }
     }
 
+    /// A UI that emits JSON events on stdout for a graphical front-end. It is
+    /// never interactive: prompts take their defaults, so callers pass `-y`.
+    pub fn json() -> Ui {
+        Ui {
+            style: Style {
+                json: true,
+                ..Style::plain()
+            },
+        }
+    }
+
+    /// Whether output is the machine-readable event stream.
+    pub fn is_json(&self) -> bool {
+        self.style.json
+    }
+
+    /// Emits a structured event in JSON mode; a no-op otherwise. Operations
+    /// use this to hand a front-end the data behind what they print.
+    pub fn emit(&self, event: &str, payload: serde_json::Value) {
+        if self.style.json {
+            json::emit(event, payload);
+        }
+    }
+
     /// The masthead shown at the start of an operation.
     pub fn banner(&self, subtitle: &str) {
+        if self.style.json {
+            return json::emit("banner", serde_json::json!({ "version": subtitle }));
+        }
         let s = &self.style;
         let mark = s.paint(Color::Violet, if s.unicode { "𝗿𝘃𝗻" } else { "rvn" });
         let name = s.bold(&s.paint(Color::White, "raven"));
@@ -54,6 +82,16 @@ impl Ui {
     }
 
     fn line(&self, color: Color, glyph: &str, message: &str) {
+        if self.style.json {
+            let kind = match color {
+                Color::Green => "ok",
+                Color::Red => "err",
+                Color::Amber => "warn",
+                Color::Violet => "step",
+                _ => "info",
+            };
+            return json::message(kind, message);
+        }
         let mut err = std::io::stderr();
         let _ = writeln!(err, "  {}  {}", self.style.paint(color, glyph), message);
     }
@@ -80,17 +118,26 @@ impl Ui {
 
     /// A blank separator line.
     pub fn blank(&self) {
+        if self.style.json {
+            return;
+        }
         let _ = writeln!(std::io::stderr());
     }
 
     /// An indented detail line under the most recent step.
     pub fn detail(&self, message: &str) {
+        if self.style.json {
+            return json::message("detail", message);
+        }
         let mut err = std::io::stderr();
         let _ = writeln!(err, "     {}", self.style.dim(message));
     }
 
     /// Renders a tree of child lines beneath a heading.
     pub fn tree(&self, items: &[String]) {
+        if self.style.json {
+            return json::emit("tree", serde_json::json!({ "items": items }));
+        }
         let g = self.style.glyphs;
         let mut err = std::io::stderr();
         for (i, item) in items.iter().enumerate() {
@@ -172,6 +219,16 @@ mod tests {
         let ui = Ui::plain();
         assert!(ui.confirm("proceed?", true));
         assert!(!ui.confirm("proceed?", false));
+    }
+
+    #[test]
+    fn json_ui_is_never_interactive() {
+        let ui = Ui::json();
+        assert!(ui.is_json());
+        assert!(!ui.style.interactive);
+        // Prompts must fall through to their defaults rather than block.
+        assert!(ui.confirm("proceed?", true));
+        assert_eq!(ui.prompt("which?"), "");
     }
 
     #[test]

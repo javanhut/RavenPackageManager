@@ -55,6 +55,13 @@ fn cli() -> Command {
                 .help("Keep downloaded packages instead of clearing them afterwards"),
         )
         .arg(
+            Arg::new("json")
+                .long("json")
+                .global(true)
+                .action(ArgAction::SetTrue)
+                .help("Emit machine-readable JSON events on stdout (for front-ends)"),
+        )
+        .arg(
             Arg::new("no-sync")
                 .long("no-sync")
                 .global(true)
@@ -207,7 +214,12 @@ fn build_context(matches: &ArgMatches, sub: &ArgMatches) -> Result<Context, Stri
             .unwrap_or_else(|| DEFAULT_CONFIG.to_string()),
     );
 
-    let mut ctx = Context::load(&config_path, Ui::new()).map_err(|e| e.to_string())?;
+    let ui = if matches.get_flag("json") {
+        Ui::json()
+    } else {
+        Ui::new()
+    };
+    let mut ctx = Context::load(&config_path, ui).map_err(|e| e.to_string())?;
     ctx.repo_only = matches.get_flag("repo-only");
     ctx.assume_yes = matches.get_flag("yes");
     ctx.keep_cache = matches.get_flag("keep-cache");
@@ -241,6 +253,24 @@ fn main() -> ExitCode {
             let query = packages(sub).join(" ");
             let hits = ops::search::run(&ctx, &query)?;
 
+            if ctx.ui.is_json() {
+                let results: Vec<serde_json::Value> = hits
+                    .iter()
+                    .take(limit)
+                    .map(|h| {
+                        let mut v = rvn::ui::json::package(&h.package);
+                        v["installed_version"] = serde_json::json!(h.installed_version);
+                        v["upgradable"] = serde_json::Value::Bool(h.upgradable);
+                        v
+                    })
+                    .collect();
+                ctx.ui.emit(
+                    "results",
+                    serde_json::json!({ "query": query, "results": results, "total": hits.len() }),
+                );
+                return Ok(());
+            }
+
             if hits.is_empty() {
                 ctx.ui.info(&format!("no packages match {query:?}"));
                 return Ok(());
@@ -271,9 +301,38 @@ fn main() -> ExitCode {
             ops::install::run(&mut ctx, &targets).map(|_| ())
         }),
 
-        Some(("info", sub)) => {
-            build_context(&matches, sub).and_then(|ctx| ops::query::info(&ctx, &packages(sub)))
-        }
+        Some(("info", sub)) => build_context(&matches, sub).and_then(|ctx| {
+            if !ctx.ui.is_json() {
+                return ops::query::info(&ctx, &packages(sub));
+            }
+            let mut missing = Vec::new();
+            let mut found = Vec::new();
+            for name in packages(sub) {
+                match ops::query::locate(&ctx, &name) {
+                    Some(pkg) => {
+                        let mut v = rvn::ui::json::package(&pkg);
+                        v["installed_version"] =
+                            serde_json::json!(ctx.local.get(&name).map(|p| p.version.clone()));
+                        v["required_by"] = serde_json::json!(
+                            ctx.local
+                                .packages
+                                .values()
+                                .filter(|p| p.depends.iter().any(|d| pkg.satisfies(d)))
+                                .map(|p| p.name.clone())
+                                .collect::<Vec<_>>()
+                        );
+                        found.push(v);
+                    }
+                    None => missing.push(name),
+                }
+            }
+            ctx.ui
+                .emit("packages", serde_json::json!({ "packages": found, "missing": missing }));
+            if !missing.is_empty() {
+                return Err(format!("no package named {}", missing.join(", ")));
+            }
+            Ok(())
+        }),
 
         Some(("list", sub)) => build_context(&matches, sub).and_then(|ctx| {
             let filter = rvn::ops::query::ListFilter {
@@ -281,6 +340,21 @@ fn main() -> ExitCode {
                 foreign: sub.get_flag("foreign"),
                 explicit: sub.get_flag("explicit"),
             };
+            if ctx.ui.is_json() {
+                let installed: Vec<serde_json::Value> = ops::query::installed(&ctx, filter)
+                    .into_iter()
+                    .map(|pkg| {
+                        let mut v = rvn::ui::json::package(pkg);
+                        v["aur"] = serde_json::Value::Bool(ops::query::is_foreign(&ctx, pkg));
+                        v["explicit"] = serde_json::Value::Bool(
+                            pkg.install_reason == rvn::pkg::InstallReason::Explicit,
+                        );
+                        v
+                    })
+                    .collect();
+                ctx.ui.emit("installed", serde_json::json!({ "packages": installed }));
+                return Ok(());
+            }
             let count = ops::query::list(&ctx, filter)?;
             if count == 0 {
                 ctx.ui.info("nothing matches");
@@ -323,9 +397,18 @@ fn main() -> ExitCode {
     };
 
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            if matches.get_flag("json") {
+                Ui::json().emit("done", serde_json::json!({}));
+            }
+            ExitCode::SUCCESS
+        }
         Err(message) => {
-            Ui::new().err(&message);
+            if matches.get_flag("json") {
+                Ui::json().emit("failed", serde_json::json!({ "message": message }));
+            } else {
+                Ui::new().err(&message);
+            }
             ExitCode::FAILURE
         }
     }

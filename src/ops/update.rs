@@ -121,6 +121,10 @@ pub fn run(ctx: &mut Context, targets: &[String], refresh: bool) -> Result<Outco
     }
 
     if candidates.is_empty() {
+        ctx.ui.emit(
+            "updates",
+            serde_json::json!({ "candidates": [], "downgrades": [], "download_size": 0 }),
+        );
         ctx.ui.ok("everything is up to date");
         return Ok(Outcome {
             updated: Vec::new(),
@@ -134,6 +138,14 @@ pub fn run(ctx: &mut Context, targets: &[String], refresh: bool) -> Result<Outco
         .into_iter()
         .partition(|c| c.kind != Kind::Downgrade);
 
+    ctx.ui.emit(
+        "updates",
+        serde_json::json!({
+            "candidates": applicable.iter().map(crate::ui::json::candidate).collect::<Vec<_>>(),
+            "downgrades": downgrades.iter().map(crate::ui::json::candidate).collect::<Vec<_>>(),
+            "download_size": upgrade::download_size(&applicable),
+        }),
+    );
     show_candidates(ctx, &applicable, &downgrades);
 
     if applicable.is_empty() {
@@ -193,6 +205,9 @@ pub fn run(ctx: &mut Context, targets: &[String], refresh: bool) -> Result<Outco
 }
 
 fn show_candidates(ctx: &Context, applicable: &[Candidate], downgrades: &[Candidate]) {
+    if ctx.ui.is_json() {
+        return;
+    }
     let s = &ctx.ui.style;
     ctx.ui.blank();
 

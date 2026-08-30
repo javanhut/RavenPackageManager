@@ -17,7 +17,7 @@ pub struct ListFilter {
 }
 
 /// Finds a package anywhere: installed first, then repositories, then the AUR.
-fn locate(ctx: &Context, name: &str) -> Option<Package> {
+pub fn locate(ctx: &Context, name: &str) -> Option<Package> {
     let installed = ctx.local.get(name);
     let repo = repo_entry(ctx, name);
 
@@ -165,14 +165,17 @@ pub fn info(ctx: &Context, names: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `rvn list`: installed packages, optionally filtered.
-pub fn list(ctx: &Context, filter: ListFilter) -> Result<usize, String> {
-    let s = &ctx.ui.style;
+/// Whether no configured repository carries an installed package.
+pub fn is_foreign(ctx: &Context, pkg: &Package) -> bool {
+    ctx.sync.iter().all(|db| db.get(&pkg.name).is_none())
+}
 
+/// The installed packages `rvn list` would show, sorted by name.
+pub fn installed(ctx: &Context, filter: ListFilter) -> Vec<&Package> {
     let mut packages: Vec<&Package> = ctx.local.packages.values().collect();
     packages.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let is_foreign = |pkg: &Package| ctx.sync.iter().all(|db| db.get(&pkg.name).is_none());
+    let is_foreign = |pkg: &Package| is_foreign(ctx, pkg);
 
     let selected: Vec<&Package> = packages
         .into_iter()
@@ -198,6 +201,14 @@ pub fn list(ctx: &Context, filter: ListFilter) -> Result<usize, String> {
             true
         })
         .collect();
+    selected
+}
+
+/// `rvn list`: installed packages, optionally filtered.
+pub fn list(ctx: &Context, filter: ListFilter) -> Result<usize, String> {
+    let s = &ctx.ui.style;
+    let selected = installed(ctx, filter);
+    let is_foreign = |pkg: &Package| is_foreign(ctx, pkg);
 
     for pkg in &selected {
         let tag = if is_foreign(pkg) {

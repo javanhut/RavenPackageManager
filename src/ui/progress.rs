@@ -132,8 +132,31 @@ impl Progress {
         self.paint();
     }
 
+    /// The event a front-end receives instead of a painted bar.
+    fn emit_json(&self) {
+        let unit = match self.unit {
+            Unit::Bytes => "bytes",
+            Unit::Count(noun) => noun,
+        };
+        super::json::emit(
+            "progress",
+            serde_json::json!({
+                "label": self.label,
+                "done": self.done,
+                "total": self.total,
+                "unit": unit,
+                "detail": self.detail,
+            }),
+        );
+    }
+
     /// Repaints now, ignoring the frame throttle.
     fn paint(&mut self) {
+        if self.style.json {
+            self.paints += 1;
+            self.last_paint = Instant::now();
+            return self.emit_json();
+        }
         if !self.style.interactive {
             return;
         }
@@ -195,6 +218,12 @@ impl Progress {
     /// Clears the bar and prints a settled summary line.
     pub fn finish(mut self, message: &str) {
         self.finished = true;
+        if self.style.json {
+            return super::json::emit(
+                "progress_done",
+                serde_json::json!({ "label": self.label, "message": message, "done": self.done, "ms": self.started.elapsed().as_millis() as u64 }),
+            );
+        }
         let mut err = std::io::stderr();
         if self.style.interactive {
             let _ = write!(err, "\r\x1b[2K");

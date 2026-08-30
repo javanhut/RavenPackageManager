@@ -83,6 +83,9 @@ pub struct Style {
     pub unicode: bool,
     pub interactive: bool,
     pub glyphs: Glyphs,
+    /// Emit machine-readable events on stdout instead of painting stderr.
+    /// Set by `rvn --json`; front-ends such as Raven Store read the stream.
+    pub json: bool,
 }
 
 impl Style {
@@ -108,6 +111,7 @@ impl Style {
             unicode,
             interactive,
             glyphs: if unicode { UNICODE } else { ASCII },
+            json: false,
         }
     }
 
@@ -118,6 +122,7 @@ impl Style {
             unicode: false,
             interactive: false,
             glyphs: ASCII,
+            json: false,
         }
     }
 
