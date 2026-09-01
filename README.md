@@ -279,6 +279,12 @@ rolled back.
 | `--no-refresh` | Use the cached databases instead of syncing first |
 | `--dry-run` | Show available updates without applying them |
 
+A dry run never needs root: when `/var/lib/pacman/sync` is not writable, the
+databases are refreshed into `~/.cache/rvn/sync` instead (the same idea as
+pacman's `checkupdates`), so update checks — the Settings app's included — run
+unprivileged. Applying updates still syncs the system databases and needs
+`sudo`.
+
 ### Update Package Manager
 
 ```bash

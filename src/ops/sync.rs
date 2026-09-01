@@ -4,7 +4,7 @@ use super::Context;
 use crate::config::{Level, Repo};
 use crate::db::sync as syncdb;
 use crate::fetch;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// How old a cached database may be before a refresh is suggested.
@@ -114,6 +114,37 @@ pub fn refresh(ctx: &mut Context) -> Result<usize, String> {
     }
 
     Ok(refreshed)
+}
+
+/// Refreshes the databases for a read-only check, without requiring root.
+///
+/// When the system sync directory is not writable, the databases are synced
+/// into a per-user cache instead of failing — the same trick as pacman's
+/// `checkupdates`. Checking whether updates exist changes nothing on the
+/// system, so it must never demand sudo; only applying them does. Callers
+/// that will go on to install must use `refresh` instead, so the databases
+/// the transaction reads are the ones root's tools will read too.
+pub fn refresh_for_check(ctx: &mut Context) -> Result<usize, String> {
+    if check_writable(&ctx.config.sync_db_path()).is_err() {
+        let dir = user_sync_dir()?;
+        check_writable(&dir)?;
+        ctx.config.sync_dir_override = Some(dir);
+    }
+    refresh(ctx)
+}
+
+/// The per-user fallback sync directory: `$XDG_CACHE_HOME/rvn/sync`.
+fn user_sync_dir() -> Result<PathBuf, String> {
+    std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|home| PathBuf::from(home).join(".cache"))
+        })
+        .map(|base| base.join("rvn").join("sync"))
+        .ok_or_else(|| "cannot pick a per-user database directory: HOME is unset".to_string())
 }
 
 /// Confirms the sync directory can actually be written to.

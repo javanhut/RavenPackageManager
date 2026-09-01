@@ -22,7 +22,15 @@ pub fn run(ctx: &mut Context, targets: &[String], refresh: bool) -> Result<Outco
     ctx.ui.banner(&format!("v{}", env!("CARGO_PKG_VERSION")));
 
     if refresh {
-        sync::refresh(ctx)?;
+        // A dry run only reads, so it may fall back to a per-user database
+        // copy rather than demanding sudo for `/var/lib/pacman/sync`. A real
+        // update must not: it goes on to install, and the databases it
+        // resolved against have to be the system ones.
+        if ctx.dry_run {
+            sync::refresh_for_check(ctx)?;
+        } else {
+            sync::refresh(ctx)?;
+        }
     } else if sync::needs_refresh(ctx) {
         ctx.ui
             .warn("repository databases are stale — run `rvn sync` or drop --no-refresh");

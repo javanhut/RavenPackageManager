@@ -101,6 +101,11 @@ pub struct Config {
     pub ignore_pkg: Vec<String>,
     pub parallel_downloads: usize,
     pub color: bool,
+    /// Redirects the sync databases away from `db_path/sync` for this
+    /// invocation. Set only at runtime (never parsed from pacman.conf), by
+    /// read-only checks that fall back to a per-user copy of the databases
+    /// when the system sync directory is not writable.
+    pub sync_dir_override: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -115,6 +120,7 @@ impl Default for Config {
             ignore_pkg: Vec::new(),
             parallel_downloads: 5,
             color: true,
+            sync_dir_override: None,
         }
     }
 }
@@ -132,7 +138,9 @@ pub fn detect_arch() -> String {
 
 impl Config {
     pub fn sync_db_path(&self) -> PathBuf {
-        self.db_path.join("sync")
+        self.sync_dir_override
+            .clone()
+            .unwrap_or_else(|| self.db_path.join("sync"))
     }
 
     pub fn local_db_path(&self) -> PathBuf {
