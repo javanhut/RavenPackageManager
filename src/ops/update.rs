@@ -31,9 +31,18 @@ pub fn run(ctx: &mut Context, targets: &[String], refresh: bool) -> Result<Outco
         } else {
             sync::refresh(ctx)?;
         }
-    } else if sync::needs_refresh(ctx) {
-        ctx.ui
-            .warn("repository databases are stale — run `rvn sync` or drop --no-refresh");
+    } else {
+        // A check that skips the refresh should still see what the last
+        // check synced, even when that landed in the per-user copy because
+        // it ran without sudo. Raven Settings and Raven Store both read
+        // through here, so this is what keeps them agreeing.
+        if ctx.dry_run && sync::prefer_fresher_copy(ctx) {
+            ctx.ui.detail("reading the databases last synced without sudo");
+        }
+        if sync::needs_refresh(ctx) {
+            ctx.ui
+                .warn("repository databases are stale — run `rvn sync` or drop --no-refresh");
+        }
     }
 
     // ---- work out what is out of date ----------------------------------

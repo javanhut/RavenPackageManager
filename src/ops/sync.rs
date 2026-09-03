@@ -133,6 +133,62 @@ pub fn refresh_for_check(ctx: &mut Context) -> Result<usize, String> {
     refresh(ctx)
 }
 
+/// Points a read-only check that is *not* refreshing at the per-user
+/// database copy when it is fresher than the system one.
+///
+/// An unprivileged `rvn update --dry-run` syncs into the per-user copy (see
+/// [`refresh_for_check`]), so a later `--no-refresh` check that only read
+/// `/var/lib/pacman/sync` would report against older databases than the one
+/// the user just refreshed — Raven Store would then disagree with Raven
+/// Settings until someone paid for a `sudo` refresh. Whichever copy was
+/// synced most recently is the truth for a check; a real update still
+/// refreshes and reads the system databases, so nothing is ever installed
+/// against the per-user copy.
+///
+/// Returns whether the per-user copy was chosen.
+pub fn prefer_fresher_copy(ctx: &mut Context) -> bool {
+    if super::is_root() || ctx.config.sync_dir_override.is_some() {
+        return false;
+    }
+    let Ok(user_dir) = user_sync_dir() else {
+        return false;
+    };
+    let system_dir = ctx.config.sync_db_path();
+    let repos: Vec<String> = ctx.config.repos.iter().map(|r| r.name.clone()).collect();
+    if !user_copy_is_fresher(&repos, &system_dir, &user_dir) {
+        return false;
+    }
+    ctx.config.sync_dir_override = Some(user_dir);
+    ctx.reload_sync();
+    true
+}
+
+/// Whether the per-user copy in `user` should be read instead of `system`:
+/// every configured repository has a database there, none is older than its
+/// system counterpart, and at least one is strictly newer. A partial copy is
+/// never preferred — a missing repository would hide its packages entirely.
+fn user_copy_is_fresher(repos: &[String], system: &Path, user: &Path) -> bool {
+    let modified = |dir: &Path, repo: &str| {
+        dir.join(format!("{repo}.db"))
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+    };
+    let mut newer = false;
+    for repo in repos {
+        let Some(theirs) = modified(user, repo) else {
+            return false;
+        };
+        match modified(system, repo) {
+            Some(ours) if theirs < ours => return false,
+            Some(ours) if theirs > ours => newer = true,
+            Some(_) => {}
+            None => newer = true,
+        }
+    }
+    !repos.is_empty() && newer
+}
+
 /// The per-user fallback sync directory: `$XDG_CACHE_HOME/rvn/sync`.
 fn user_sync_dir() -> Result<PathBuf, String> {
     std::env::var_os("XDG_CACHE_HOME")
@@ -368,6 +424,80 @@ mod tests {
     fn an_unwritable_note_is_not_fatal() {
         // The marker is an optimisation; losing it costs a probe, not a sync.
         remember_no_signature(Path::new("/nonexistent/rvn/core.db.nosig"), "core");
+    }
+
+    fn copy_with(dir: &Path, repos: &[(&str, Duration)]) {
+        std::fs::create_dir_all(dir).unwrap();
+        for (repo, age) in repos {
+            let db = dir.join(format!("{repo}.db"));
+            std::fs::write(&db, b"db").unwrap();
+            backdate(&db, *age);
+        }
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = marker_path(tag).with_extension("dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_fresher_complete_user_copy_is_preferred() {
+        let system = scratch("fresher-system");
+        let user = scratch("fresher-user");
+        let repos = vec!["core".to_string(), "extra".to_string()];
+        copy_with(&system, &[("core", Duration::from_secs(3600)), ("extra", Duration::from_secs(3600))]);
+        copy_with(&user, &[("core", Duration::from_secs(60)), ("extra", Duration::from_secs(60))]);
+        assert!(user_copy_is_fresher(&repos, &system, &user));
+    }
+
+    #[test]
+    fn an_older_user_copy_is_left_alone() {
+        let system = scratch("older-system");
+        let user = scratch("older-user");
+        let repos = vec!["core".to_string()];
+        copy_with(&system, &[("core", Duration::from_secs(60))]);
+        copy_with(&user, &[("core", Duration::from_secs(3600))]);
+        assert!(!user_copy_is_fresher(&repos, &system, &user));
+    }
+
+    #[test]
+    fn a_partial_user_copy_is_never_preferred() {
+        let system = scratch("partial-system");
+        let user = scratch("partial-user");
+        let repos = vec!["core".to_string(), "extra".to_string()];
+        copy_with(&system, &[("core", Duration::from_secs(3600)), ("extra", Duration::from_secs(3600))]);
+        copy_with(&user, &[("core", Duration::from_secs(60))]);
+        assert!(!user_copy_is_fresher(&repos, &system, &user));
+    }
+
+    #[test]
+    fn a_mixed_user_copy_is_never_preferred() {
+        // One repository fresher, another staler: reading the user copy
+        // would trade one stale database for another.
+        let system = scratch("mixed-system");
+        let user = scratch("mixed-user");
+        let repos = vec!["core".to_string(), "extra".to_string()];
+        copy_with(&system, &[("core", Duration::from_secs(3600)), ("extra", Duration::from_secs(60))]);
+        copy_with(&user, &[("core", Duration::from_secs(60)), ("extra", Duration::from_secs(3600))]);
+        assert!(!user_copy_is_fresher(&repos, &system, &user));
+    }
+
+    #[test]
+    fn a_missing_system_database_counts_as_older() {
+        let system = scratch("missing-system");
+        let user = scratch("missing-user");
+        let repos = vec!["core".to_string()];
+        std::fs::create_dir_all(&system).unwrap();
+        copy_with(&user, &[("core", Duration::from_secs(60))]);
+        assert!(user_copy_is_fresher(&repos, &system, &user));
+    }
+
+    #[test]
+    fn no_repositories_means_nothing_to_prefer() {
+        let system = scratch("none-system");
+        let user = scratch("none-user");
+        assert!(!user_copy_is_fresher(&[], &system, &user));
     }
 
     #[test]

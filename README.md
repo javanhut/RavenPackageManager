@@ -281,9 +281,12 @@ rolled back.
 
 A dry run never needs root: when `/var/lib/pacman/sync` is not writable, the
 databases are refreshed into `~/.cache/rvn/sync` instead (the same idea as
-pacman's `checkupdates`), so update checks — the Settings app's included — run
-unprivileged. Applying updates still syncs the system databases and needs
-`sudo`.
+pacman's `checkupdates`), so update checks — Raven Settings' and Raven Store's
+included — run unprivileged. A dry run with `--no-refresh` reads whichever
+copy was synced most recently, the system one or the per-user one, so a
+check made in one place is what every other check sees; a per-user copy is
+only preferred when it is complete and no older for any repository. Applying
+updates still syncs the system databases and needs `sudo`.
 
 ### Update Package Manager
 
