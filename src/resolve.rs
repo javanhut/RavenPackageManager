@@ -152,32 +152,80 @@ impl<'a> Resolver<'a> {
         self.sync.iter().find_map(|db| db.get(name))
     }
 
-    /// Finds any package satisfying `dep`, checking exact names first and
-    /// falling back to `%PROVIDES%` scanning.
-    fn find(&self, dep: &Dep) -> Option<Package> {
+    /// Every sync package satisfying `dep`: the exact name match first, then
+    /// providers from best version down. Repo order breaks version ties.
+    fn candidates(&self, dep: &Dep) -> Vec<&Package> {
+        let mut out: Vec<&Package> = Vec::new();
         if let Some(pkg) = self.sync_get(&dep.name) {
             if dep.satisfied_by(&pkg.version) {
-                return Some(pkg.clone());
+                out.push(pkg);
             }
         }
+        let mut providers: Vec<&Package> = self
+            .sync
+            .iter()
+            .flat_map(|db| db.packages.iter())
+            .filter(|pkg| pkg.name != dep.name && pkg.satisfies(dep))
+            .collect();
+        // Stable sort keeps the earlier repo first among equal versions.
+        providers.sort_by(|a, b| vercmp(&b.version, &a.version));
+        out.extend(providers);
+        out
+    }
 
-        // Provides can come from any repo; take the best version available.
-        let mut best: Option<&Package> = None;
-        for db in self.sync {
-            for pkg in &db.packages {
-                if pkg.satisfies(dep) {
-                    let better = match best {
-                        None => true,
-                        Some(cur) => vercmp(&pkg.version, &cur.version) == Ordering::Greater,
-                    };
-                    if better {
-                        best = Some(pkg);
-                    }
-                }
+    /// Whether `pkg` can sit alongside every package already chosen.
+    fn compatible_with_plan(pkg: &Package, chosen: &HashMap<String, Package>) -> bool {
+        chosen.values().all(|other| {
+            other.name == pkg.name || !Self::clash(pkg, other) && !Self::clash(other, pkg)
+        })
+    }
+
+    /// Whether `a` declares a conflict that `b` satisfies.
+    fn clash(a: &Package, b: &Package) -> bool {
+        a.conflicts
+            .iter()
+            .any(|c| c.name != a.name && b.satisfies(c))
+    }
+
+    /// Whether `pkg` conflicts with something installed that it does not
+    /// itself replace (a rename is expressed as conflicts + replaces).
+    fn clashes_with_installed(&self, pkg: &Package) -> bool {
+        pkg.conflicts.iter().any(|c| {
+            if c.name == pkg.name {
+                return false;
             }
-        }
-        if let Some(pkg) = best {
-            return Some(pkg.clone());
+            match self.local.satisfier(c) {
+                Some(installed) => {
+                    installed.name != pkg.name
+                        && !pkg.replaces.iter().any(|r| installed.satisfies(r))
+                }
+                None => false,
+            }
+        })
+    }
+
+    /// Finds a package satisfying `dep` that fits the plan built so far.
+    ///
+    /// A virtual dependency such as `libz.so=1-32` can have several
+    /// providers that conflict with one another (lib32-zlib and
+    /// lib32-zlib-ng-compat, say). Picking purely by version would put both
+    /// in the plan whenever another package names one of them directly, so
+    /// providers that clash with a chosen package are skipped, and ones that
+    /// clash with an installed package are used only as a last resort.
+    /// Exact names still win when they fit, matching pacman.
+    fn find(&self, dep: &Dep, chosen: &HashMap<String, Package>) -> Option<Package> {
+        let candidates = self.candidates(dep);
+        let pick = candidates
+            .iter()
+            .find(|p| Self::compatible_with_plan(p, chosen) && !self.clashes_with_installed(p))
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|p| Self::compatible_with_plan(p, chosen))
+            })
+            .or_else(|| candidates.first());
+        if let Some(pkg) = pick {
+            return Some((*pkg).clone());
         }
 
         // Fall back to the AUR only once the official repos have nothing.
@@ -192,7 +240,9 @@ impl<'a> Resolver<'a> {
     /// Builds an install plan for the given target names.
     pub fn resolve(&self, targets: &[String]) -> Plan {
         let mut plan = Plan::default();
-        let mut seen: HashMap<String, ()> = HashMap::new();
+        // Packages chosen so far, keyed by name. Later lookups consult this
+        // so one virtual dependency is never satisfied twice over.
+        let mut seen: HashMap<String, Package> = HashMap::new();
         let mut stack: Vec<String> = Vec::new();
 
         for target in targets {
@@ -210,7 +260,7 @@ impl<'a> Resolver<'a> {
                 }
             }
 
-            match self.find(&dep) {
+            match self.find(&dep, &seen) {
                 Some(pkg) => {
                     self.visit(pkg, Reason::Explicit, &mut plan, &mut seen, &mut stack);
                 }
@@ -246,7 +296,7 @@ impl<'a> Resolver<'a> {
         pkg: Package,
         reason: Reason,
         plan: &mut Plan,
-        seen: &mut HashMap<String, ()>,
+        seen: &mut HashMap<String, Package>,
         stack: &mut Vec<String>,
     ) {
         // The cycle check must come before the `seen` check: a package caught
@@ -264,7 +314,7 @@ impl<'a> Resolver<'a> {
             return;
         }
 
-        seen.insert(pkg.name.clone(), ());
+        seen.insert(pkg.name.clone(), pkg.clone());
         stack.push(pkg.name.clone());
 
         // Build-time dependencies only matter for packages rvn compiles.
@@ -284,7 +334,22 @@ impl<'a> Resolver<'a> {
             if self.local.satisfier(dep).is_some() {
                 continue;
             }
-            match self.find(dep) {
+            // Something already in the plan may satisfy this through a
+            // provide; revisiting it records a cycle if there is one and
+            // otherwise returns straight away.
+            if let Some(existing) = seen.values().find(|p| p.satisfies(dep)).cloned() {
+                self.visit(
+                    existing,
+                    Reason::Dependency {
+                        of: pkg.name.clone(),
+                    },
+                    plan,
+                    seen,
+                    stack,
+                );
+                continue;
+            }
+            match self.find(dep, seen) {
                 Some(child) => {
                     let child_reason = if is_make {
                         Reason::MakeDependency {
@@ -343,10 +408,7 @@ impl<'a> Resolver<'a> {
                 // package is how a rename is expressed. Treating it as a
                 // conflict would block every renamed package.
                 if let Some(installed) = self.local.satisfier(conflict) {
-                    let is_replacement = pkg
-                        .replaces
-                        .iter()
-                        .any(|r| installed.satisfies(r));
+                    let is_replacement = pkg.replaces.iter().any(|r| installed.satisfies(r));
                     if is_replacement && !incoming.iter().any(|p| p.name == installed.name) {
                         let entry = (pkg.name.clone(), installed.name.clone());
                         if !plan.replacing.contains(&entry) {
@@ -450,7 +512,10 @@ mod tests {
     }
 
     fn names(plan: &Plan) -> Vec<String> {
-        plan.install.iter().map(|r| r.package.name.clone()).collect()
+        plan.install
+            .iter()
+            .map(|r| r.package.name.clone())
+            .collect()
     }
 
     #[test]
@@ -472,7 +537,10 @@ mod tests {
 
     #[test]
     fn skips_dependencies_already_installed() {
-        let dbs = sync_db(vec![pkg("app", "1.0-1", &["libfoo"]), pkg("libfoo", "2.0-1", &[])]);
+        let dbs = sync_db(vec![
+            pkg("app", "1.0-1", &["libfoo"]),
+            pkg("libfoo", "2.0-1", &[]),
+        ]);
         let mut local = empty_local();
         local
             .packages
@@ -486,7 +554,9 @@ mod tests {
     fn already_installed_target_is_reported_not_reinstalled() {
         let dbs = sync_db(vec![pkg("app", "1.0-1", &[])]);
         let mut local = empty_local();
-        local.packages.insert("app".into(), pkg("app", "1.0-1", &[]));
+        local
+            .packages
+            .insert("app".into(), pkg("app", "1.0-1", &[]));
 
         let plan = Resolver::new(&dbs, &local, &NoSource).resolve(&["app".into()]);
         assert!(plan.install.is_empty());
@@ -497,7 +567,9 @@ mod tests {
     fn forced_targets_are_reinstalled_at_the_same_version() {
         let dbs = sync_db(vec![pkg("app", "1.0-1", &[])]);
         let mut local = empty_local();
-        local.packages.insert("app".into(), pkg("app", "1.0-1", &[]));
+        local
+            .packages
+            .insert("app".into(), pkg("app", "1.0-1", &[]));
 
         // Without forcing, an identical version is left alone.
         let plan = Resolver::new(&dbs, &local, &NoSource).resolve(&["app".into()]);
@@ -516,7 +588,9 @@ mod tests {
     fn newer_sync_version_is_an_upgrade() {
         let dbs = sync_db(vec![pkg("app", "2.0-1", &[])]);
         let mut local = empty_local();
-        local.packages.insert("app".into(), pkg("app", "1.0-1", &[]));
+        local
+            .packages
+            .insert("app".into(), pkg("app", "1.0-1", &[]));
 
         let plan = Resolver::new(&dbs, &local, &NoSource).resolve(&["app".into()]);
         assert_eq!(names(&plan), vec!["app"]);
@@ -535,6 +609,61 @@ mod tests {
         let plan = Resolver::new(&dbs, &local, &NoSource).resolve(&["app".into()]);
         assert!(plan.missing.is_empty(), "missing: {:?}", plan.missing);
         assert_eq!(names(&plan), vec!["openjdk21", "app"]);
+    }
+
+    fn zlib_pair() -> (Package, Package) {
+        let mut plain = pkg("lib32-zlib", "1.3.1-2", &[]);
+        plain.provides = vec![Dep::parse("libz.so=1-32")];
+        let mut ng = pkg("lib32-zlib-ng-compat", "2.2.4-1", &[]);
+        ng.provides = vec![Dep::parse("lib32-zlib"), Dep::parse("libz.so=1-32")];
+        ng.conflicts = vec![Dep::parse("lib32-zlib")];
+        (plain, ng)
+    }
+
+    #[test]
+    fn a_virtual_dependency_never_pulls_a_second_conflicting_provider() {
+        // Steam's graph names lib32-zlib directly in one place and asks for
+        // libz.so=1-32 in another; both providers must not end up in the plan.
+        for deps in [
+            &["lib32-zlib", "libz.so=1-32"][..],
+            &["libz.so=1-32", "lib32-zlib"][..],
+        ] {
+            let (plain, ng) = zlib_pair();
+            let dbs = sync_db(vec![pkg("app", "1.0-1", deps), plain, ng]);
+            let local = empty_local();
+            let plan = Resolver::new(&dbs, &local, &NoSource).resolve(&["app".into()]);
+
+            assert!(plan.missing.is_empty(), "missing: {:?}", plan.missing);
+            assert!(plan.conflicts.is_empty(), "conflicts: {:?}", plan.conflicts);
+            let chosen = names(&plan);
+            assert_eq!(chosen.len(), 2, "plan: {chosen:?}");
+            assert_eq!(chosen[1], "app");
+        }
+    }
+
+    #[test]
+    fn an_exact_name_still_wins_over_a_newer_provider() {
+        let (plain, ng) = zlib_pair();
+        let dbs = sync_db(vec![pkg("app", "1.0-1", &["lib32-zlib"]), plain, ng]);
+        let local = empty_local();
+        let plan = Resolver::new(&dbs, &local, &NoSource).resolve(&["app".into()]);
+        assert_eq!(names(&plan), vec!["lib32-zlib", "app"]);
+    }
+
+    #[test]
+    fn a_provider_clashing_with_an_installed_package_is_avoided() {
+        let (plain, ng) = zlib_pair();
+        let dbs = sync_db(vec![pkg("app", "1.0-1", &["libz.so=1-32"]), plain, ng]);
+        // Not a satisfier of libz.so=1-32 itself, but something ng conflicts
+        // with: an older lib32-zlib lacking the soname provide.
+        let mut local = empty_local();
+        let mut old = pkg("lib32-zlib", "1.2.0-1", &[]);
+        old.origin = Origin::Local;
+        local.packages.insert(old.name.clone(), old);
+        let plan = Resolver::new(&dbs, &local, &NoSource).resolve(&["app".into()]);
+
+        assert!(plan.conflicts.is_empty(), "conflicts: {:?}", plan.conflicts);
+        assert_eq!(names(&plan), vec!["lib32-zlib", "app"]);
     }
 
     #[test]
@@ -644,7 +773,10 @@ mod tests {
 
     #[test]
     fn ignored_packages_are_skipped() {
-        let dbs = sync_db(vec![pkg("app", "1.0-1", &["libfoo"]), pkg("libfoo", "2.0-1", &[])]);
+        let dbs = sync_db(vec![
+            pkg("app", "1.0-1", &["libfoo"]),
+            pkg("libfoo", "2.0-1", &[]),
+        ]);
         let local = empty_local();
         let plan = Resolver::new(&dbs, &local, &NoSource)
             .ignoring(&["libfoo".to_string()])
@@ -661,7 +793,10 @@ mod tests {
 
     #[test]
     fn aur_packages_pull_repo_dependencies_and_makedepends() {
-        let dbs = sync_db(vec![pkg("glibc", "2.39-1", &[]), pkg("rust", "1.80-1", &[])]);
+        let dbs = sync_db(vec![
+            pkg("glibc", "2.39-1", &[]),
+            pkg("rust", "1.80-1", &[]),
+        ]);
         let local = empty_local();
 
         let aur_pkg = Package {
@@ -684,7 +819,11 @@ mod tests {
         assert!(order.contains(&"rust".to_string()));
         assert_eq!(plan.aur_count(), 1);
 
-        let rust = plan.install.iter().find(|r| r.package.name == "rust").unwrap();
+        let rust = plan
+            .install
+            .iter()
+            .find(|r| r.package.name == "rust")
+            .unwrap();
         assert!(matches!(rust.reason, Reason::MakeDependency { .. }));
     }
 
