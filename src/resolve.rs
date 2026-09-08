@@ -13,6 +13,23 @@ use crate::version::vercmp;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
+/// What makepkg needs on disk before it can build anything, added to every
+/// AUR package's make-dependencies whether or not its PKGBUILD lists them.
+///
+/// A PKGBUILD names the tools *its* build needs and takes makepkg itself for
+/// granted -- on Arch that is a safe assumption, on RavenLinux it is not: the
+/// base image ships rvn and no makepkg, so `rvn install brave-bin` resolved
+/// 178 repository dependencies, installed every one, and then failed with
+/// "makepkg is required to build AUR packages". The toolchain is an ordinary
+/// repository dependency like any other and resolves the same way.
+///
+/// `base-devel` is what pacman's own metadata names as "required to use
+/// makepkg" (fakeroot, binutils for strip, debugedit for the default `debug`
+/// option, file, gzip and the rest); `git` is how the build files are fetched.
+/// Anything already installed is skipped by the resolver like every other
+/// satisfied dependency, so on a machine that has them this adds nothing.
+const AUR_TOOLCHAIN: &[&str] = &["base-devel", "git"];
+
 /// A source of packages that is not a local sync database — in practice the
 /// AUR. Abstracted so resolution is testable without network access.
 pub trait Source {
@@ -317,9 +334,12 @@ impl<'a> Resolver<'a> {
         seen.insert(pkg.name.clone(), pkg.clone());
         stack.push(pkg.name.clone());
 
-        // Build-time dependencies only matter for packages rvn compiles.
+        // Build-time dependencies only matter for packages rvn compiles --
+        // and for those, the toolchain that runs the build counts as one.
         let build_deps: Vec<Dep> = if pkg.origin.is_aur() {
-            pkg.makedepends.clone()
+            let mut deps = pkg.makedepends.clone();
+            deps.extend(AUR_TOOLCHAIN.iter().map(|tool| Dep::parse(tool)));
+            deps
         } else {
             Vec::new()
         };
@@ -797,7 +817,8 @@ mod tests {
             pkg("glibc", "2.39-1", &[]),
             pkg("rust", "1.80-1", &[]),
         ]);
-        let local = empty_local();
+        let mut local = empty_local();
+        toolchain_installed(&mut local);
 
         let aur_pkg = Package {
             name: "mytool".into(),
@@ -831,6 +852,7 @@ mod tests {
     fn detects_an_aur_upgrade_for_a_package_not_in_any_repo() {
         let dbs = sync_db(vec![]);
         let mut local = empty_local();
+        toolchain_installed(&mut local);
         local
             .packages
             .insert("mytool".into(), pkg("mytool", "0.1.0-1", &[]));
@@ -885,5 +907,61 @@ mod tests {
         assert_eq!(plan.install.len(), 1);
         assert_eq!(plan.install[0].package.origin.label(), "core");
         assert_eq!(plan.aur_count(), 0);
+    }
+
+    /// Marks the makepkg toolchain as present, for tests about something else.
+    fn toolchain_installed(local: &mut LocalDb) {
+        for tool in AUR_TOOLCHAIN {
+            local
+                .packages
+                .insert((*tool).into(), pkg(tool, "1-1", &[]));
+        }
+    }
+
+    // The base image has no makepkg. A PKGBUILD never lists it -- it lists
+    // what its own build needs and assumes the builder -- so an AUR package
+    // with no makedepends at all must still bring the toolchain with it.
+    #[test]
+    fn aur_packages_pull_the_makepkg_toolchain_even_with_no_makedepends() {
+        let dbs = sync_db(vec![
+            pkg("base-devel", "1-2", &[]),
+            pkg("git", "2.55.0-1", &[]),
+        ]);
+        let local = empty_local();
+        let aur = FakeAur(vec![Package {
+            name: "brave-bin".into(),
+            version: "1.94.121-1".into(),
+            origin: Origin::Aur,
+            ..Default::default()
+        }]);
+
+        let plan = Resolver::new(&dbs, &local, &aur).resolve(&["brave-bin".into()]);
+        assert!(plan.missing.is_empty(), "missing: {:?}", plan.missing);
+
+        let order = names(&plan);
+        assert_eq!(order.last().unwrap(), "brave-bin");
+        for tool in AUR_TOOLCHAIN {
+            assert!(order.contains(&tool.to_string()), "{tool} not planned: {order:?}");
+            let resolved = plan
+                .install
+                .iter()
+                .find(|r| r.package.name == *tool)
+                .unwrap();
+            assert!(matches!(resolved.reason, Reason::MakeDependency { .. }));
+        }
+    }
+
+    // The toolchain is for builds. Installing a repository package must not
+    // drag gcc onto the machine.
+    #[test]
+    fn repo_packages_do_not_pull_the_makepkg_toolchain() {
+        let dbs = sync_db(vec![
+            pkg("go", "1.22-1", &[]),
+            pkg("base-devel", "1-2", &[]),
+            pkg("git", "2.55.0-1", &[]),
+        ]);
+        let plan =
+            Resolver::new(&dbs, &empty_local(), &FakeAur(vec![])).resolve(&["go".into()]);
+        assert_eq!(names(&plan), vec!["go"]);
     }
 }

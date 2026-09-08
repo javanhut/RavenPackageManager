@@ -9,6 +9,36 @@ use crate::db::sync as syncdb;
 use crate::extract;
 use crate::fetch;
 use crate::pkg::{BackupFile, InstallReason, Package};
+
+/// Paths a package payload may never replace, however the hash bookkeeping
+/// comes out.
+///
+/// The `pristine` test in `install_one` asks "did the user edit this file?"
+/// and, for an ordinary config file, answers it correctly: one that still
+/// matches the hash recorded at install time is untouched, so it follows the
+/// package across an upgrade. For the account database that question is the
+/// wrong one. Nobody hand-edits /etc/passwd, so an image's own generated copy
+/// reads as untouched -- and Arch's `filesystem` package, which lists every
+/// path below as `backup`, ships a one-line /etc/passwd, a one-line
+/// /etc/group and a root-only /etc/shadow.
+///
+/// Letting the payload win there empties the machine of accounts in one
+/// extraction: `dbus-daemon --system` can no longer resolve the `dbus` user
+/// and `seatd -g video` no longer resolves the `video` group, so both exit
+/// the instant they start and the supervisor restarts them forever; no
+/// uid >= 1000 is left for the graphical session to run as; root's password
+/// hash is gone; and `sudo` answers "you do not exist in the passwd
+/// database". The disk copy of these files wins unconditionally, and the
+/// package's version goes to `.pacnew` like any other spared config.
+const NEVER_REPLACED: &[&str] = &[
+    "etc/passwd",
+    "etc/group",
+    "etc/shadow",
+    "etc/gshadow",
+    "etc/subuid",
+    "etc/subgid",
+    "etc/sudoers",
+];
 use crate::resolve::{NoSource, Plan, Resolved, Resolver};
 use crate::scriptlet::{self, Hook};
 use crate::ui::spinner::Spinner;
@@ -686,6 +716,9 @@ fn install_archives(
                 if !disk.is_file() {
                     return false;
                 }
+                if NEVER_REPLACED.contains(&rel.as_str()) {
+                    return true;
+                }
                 let pristine = previous_backup
                     .iter()
                     .find(|b| b.path == **rel)
@@ -1235,9 +1268,17 @@ fn build_aur(
     let on_step = |step: &str| spinner.set_message(&format!("building {} — {step}", pkg.name));
     let dir = crate::aur::build_dir(cache, &pkg.name);
 
+    // The resolver adds the makepkg toolchain (`base-devel`, `git`) to every
+    // AUR package's make-dependencies, and repository packages install before
+    // any build starts -- so by the time this runs makepkg is on disk. The
+    // check stays as a backstop: if it fires, the toolchain install itself
+    // failed, and the message should say what to do rather than name a
+    // package manager this system does not use.
     if Command::new("makepkg").arg("--version").output().is_err() {
         return Err(
-            "makepkg is required to build AUR packages; install the `pacman` package".into(),
+            "makepkg is not installed; the build toolchain should have been pulled in \
+             with this package -- try `rvn install base-devel` and then retry"
+                .into(),
         );
     }
 
@@ -1673,5 +1714,35 @@ mod tests {
         assert!(args.contains(&"--reuid=65534".to_string()), "{args:?}");
         assert!(args.contains(&"--regid=65534".to_string()), "{args:?}");
         assert!(args.contains(&"makepkg".to_string()));
+    }
+
+    // The account database is what `filesystem` would overwrite, and the
+    // pristine test cannot protect it: nobody edits these files by hand, so an
+    // image's own generated copy is indistinguishable from an untouched one.
+    #[test]
+    fn the_account_database_is_never_replaced_by_a_payload() {
+        for path in ["etc/passwd", "etc/group", "etc/shadow", "etc/gshadow"] {
+            assert!(
+                NEVER_REPLACED.contains(&path),
+                "{path} must never be replaced by a package payload"
+            );
+        }
+    }
+
+    // Paths are matched as the `backup` field spells them -- relative, no
+    // leading slash -- so an absolute spelling here would silently never hit.
+    #[test]
+    fn never_replaced_paths_are_relative() {
+        for path in NEVER_REPLACED {
+            assert!(!path.starts_with('/'), "{path} must not be absolute");
+        }
+    }
+
+    // An ordinary config file still follows its package across an upgrade when
+    // the user has not touched it; the list is a floor, not a blanket.
+    #[test]
+    fn ordinary_config_is_not_on_the_list() {
+        assert!(!NEVER_REPLACED.contains(&"etc/pacman.conf"));
+        assert!(!NEVER_REPLACED.contains(&"etc/fstab"));
     }
 }
