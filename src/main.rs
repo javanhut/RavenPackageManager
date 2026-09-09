@@ -198,6 +198,94 @@ fn cli() -> Command {
         )
 }
 
+/// Run a privileged operation through rvnd when this process is not root.
+///
+/// Returns `None` when the operation should run in-process as before: we are
+/// root, the caller chose a configuration file of their own (the daemon only
+/// ever uses the system's), or there is no daemon to talk to. In the last
+/// case the in-process path fails the way it always has, and the hint about
+/// the daemon is printed first so the failure explains itself.
+///
+/// Terminal use is two phases: the daemon runs the operation with
+/// `--dry-run` and the plan is shown; then, once the person says yes, it runs
+/// for real. Nothing on the wire is interactive, so the question is asked
+/// here. `--yes` skips the first phase; `--dry-run` skips the second. In
+/// `--json` mode the events are relayed verbatim and there is one phase, as
+/// there always was for a front-end.
+fn via_daemon(matches: &ArgMatches, sub: &ArgMatches, mut req: rvn::daemon::Request) -> Option<Result<(), String>> {
+    use rvn::daemon::{Reach, reach, request, Replay, SOCKET_PATH};
+
+    if ops::is_root() {
+        return None;
+    }
+    if matches
+        .get_one::<String>("config")
+        .is_some_and(|c| c != DEFAULT_CONFIG)
+    {
+        return None;
+    }
+    // RVN_SOCKET points a client at another daemon; for development and for
+    // tests, which run a stand-in on a temporary socket.
+    let socket_override = std::env::var("RVN_SOCKET").ok();
+    let socket = std::path::Path::new(socket_override.as_deref().unwrap_or(SOCKET_PATH));
+    let json = matches.get_flag("json");
+    match reach(socket) {
+        Reach::Ok => {}
+        Reach::Absent => {
+            if !json {
+                Ui::new().warn("rvnd is not running, so this needs root: `sudo rvn ...`, or `sudo raven-rc start rvnd`");
+            }
+            return None;
+        }
+        Reach::Denied => {
+            let msg = format!(
+                "not allowed to use rvnd: {} is for members of the {} group; use sudo, or add yourself to the group and log in again",
+                SOCKET_PATH,
+                rvn::daemon::DEFAULT_GROUP
+            );
+            return Some(Err(msg));
+        }
+        Reach::Other(e) => return Some(Err(format!("rvnd: {e}"))),
+    }
+
+    req.repo_only = matches.get_flag("repo-only");
+    req.keep_cache = matches.get_flag("keep-cache");
+    req.no_sync = matches.get_flag("no-sync");
+    let dry_run_asked = sub.try_get_one::<bool>("dry-run").ok().flatten().copied() == Some(true);
+    let assume_yes = matches.get_flag("yes") || json;
+
+    if json {
+        req.dry_run = dry_run_asked;
+        return Some(request(socket, &req, |line| println!("{line}")));
+    }
+
+    let ui = Ui::new();
+    let run = |req: &rvn::daemon::Request, show_banner: bool| -> Result<(), String> {
+        let mut replay = Replay::new(&ui, show_banner);
+        let result = request(socket, req, |line| replay.event(line));
+        replay.finish();
+        result
+    };
+
+    // Phase one: the plan. Skipped when the answer is already yes, and the
+    // only phase when only the plan was asked for. `sync` has no plan.
+    let needs_plan = req.op != Some(rvn::daemon::Op::Sync) && (dry_run_asked || !assume_yes);
+    if needs_plan {
+        req.dry_run = true;
+        if let Err(e) = run(&req, true) {
+            return Some(Err(e));
+        }
+        if dry_run_asked {
+            return Some(Ok(()));
+        }
+        if !ui.confirm("proceed?", true) {
+            return Some(Err("cancelled".into()));
+        }
+    }
+    req.dry_run = false;
+    Some(run(&req, !needs_plan))
+}
+
 fn packages(matches: &ArgMatches) -> Vec<String> {
     matches
         .get_many::<String>("packages")
@@ -237,11 +325,22 @@ fn main() -> ExitCode {
     let matches = cli().get_matches();
 
     let result = match matches.subcommand() {
-        Some(("install", sub)) => build_context(&matches, sub).and_then(|mut ctx| {
-            ops::install::run(&mut ctx, &packages(sub)).map(|outcome| {
-                if outcome.installed.is_empty() && outcome.skipped.is_empty() {
-                    ctx.ui.info("nothing to do");
-                }
+        Some(("install", sub)) => via_daemon(
+            &matches,
+            sub,
+            rvn::daemon::Request {
+                op: Some(rvn::daemon::Op::Install),
+                packages: packages(sub),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|| {
+            build_context(&matches, sub).and_then(|mut ctx| {
+                ops::install::run(&mut ctx, &packages(sub)).map(|outcome| {
+                    if outcome.installed.is_empty() && outcome.skipped.is_empty() {
+                        ctx.ui.info("nothing to do");
+                    }
+                })
             })
         }),
 
@@ -298,6 +397,17 @@ fn main() -> ExitCode {
                 .iter()
                 .map(|n| hits[n - 1].package.name.clone())
                 .collect();
+            if let Some(result) = via_daemon(
+                &matches,
+                sub,
+                rvn::daemon::Request {
+                    op: Some(rvn::daemon::Op::Install),
+                    packages: targets.clone(),
+                    ..Default::default()
+                },
+            ) {
+                return result;
+            }
             ops::install::run(&mut ctx, &targets).map(|_| ())
         }),
 
@@ -370,27 +480,63 @@ fn main() -> ExitCode {
             build_context(&matches, sub).and_then(|ctx| ops::query::files(&ctx, &packages(sub)))
         }
 
-        Some(("sync", sub)) => build_context(&matches, sub).and_then(|mut ctx| {
-            ctx.ui.banner(&format!("v{}", get_version()));
-            ops::sync::refresh(&mut ctx).map(|n| {
-                ctx.ui.ok(&format!("{n} repositories up to date"));
+        Some(("sync", sub)) => via_daemon(
+            &matches,
+            sub,
+            rvn::daemon::Request {
+                op: Some(rvn::daemon::Op::Sync),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|| {
+            build_context(&matches, sub).and_then(|mut ctx| {
+                ctx.ui.banner(&format!("v{}", get_version()));
+                ops::sync::refresh(&mut ctx).map(|n| {
+                    ctx.ui.ok(&format!("{n} repositories up to date"));
+                })
             })
         }),
 
-        Some(("uninstall", sub)) => build_context(&matches, sub).and_then(|mut ctx| {
-            // Removing a package should not leave its dependencies behind,
-            // so orphan cleanup is the default rather than a flag to remember.
-            let options = rvn::remove::Options {
+        Some(("uninstall", sub)) => via_daemon(
+            &matches,
+            sub,
+            rvn::daemon::Request {
+                op: Some(rvn::daemon::Op::Uninstall),
+                packages: packages(sub),
                 cascade: sub.get_flag("cascade"),
-                recursive: !sub.get_flag("keep-orphans"),
+                keep_orphans: sub.get_flag("keep-orphans"),
                 nodeps: sub.get_flag("nodeps"),
-            };
-            ops::remove::run(&mut ctx, &packages(sub), options).map(|_| ())
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|| {
+            build_context(&matches, sub).and_then(|mut ctx| {
+                // Removing a package should not leave its dependencies behind,
+                // so orphan cleanup is the default rather than a flag to remember.
+                let options = rvn::remove::Options {
+                    cascade: sub.get_flag("cascade"),
+                    recursive: !sub.get_flag("keep-orphans"),
+                    nodeps: sub.get_flag("nodeps"),
+                };
+                ops::remove::run(&mut ctx, &packages(sub), options).map(|_| ())
+            })
         }),
 
-        Some(("update", sub)) => build_context(&matches, sub).and_then(|mut ctx| {
-            let refresh = !sub.get_flag("no-refresh");
-            ops::update::run(&mut ctx, &packages(sub), refresh).map(|_| ())
+        Some(("update", sub)) => via_daemon(
+            &matches,
+            sub,
+            rvn::daemon::Request {
+                op: Some(rvn::daemon::Op::Update),
+                packages: packages(sub),
+                no_refresh: sub.get_flag("no-refresh"),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|| {
+            build_context(&matches, sub).and_then(|mut ctx| {
+                let refresh = !sub.get_flag("no-refresh");
+                ops::update::run(&mut ctx, &packages(sub), refresh).map(|_| ())
+            })
         }),
 
         _ => unreachable!("subcommand_required(true) guarantees a subcommand"),

@@ -42,7 +42,8 @@ run = [
   "echo \"Installing {{binary}} to {{bindir}}...\"",
   "install -d {{bindir}}",
   "install -m 755 {{target}} {{bindir}}/{{binary}}",
-  "echo \"Installed {{binary}} to {{bindir}}/{{binary}}\"",
+  "install -m 755 target/release/rvnd {{bindir}}/rvnd",
+  "echo \"Installed {{binary}} and rvnd to {{bindir}}\"",
   "echo \"Run 'rvn --version' to verify.\"",
 ]
 
@@ -51,7 +52,7 @@ desc = "Uninstall rvn from /usr/local/bin"
 escalate = true
 run = [
   "echo \"Removing {{bindir}}/{{binary}}...\"",
-  "rm -f {{bindir}}/{{binary}}",
+  "rm -f {{bindir}}/{{binary}} {{bindir}}/rvnd",
   "echo \"Uninstalled {{binary}}\"",
 ]
 

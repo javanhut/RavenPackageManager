@@ -27,6 +27,47 @@ official repositories and the AUR are both handled by a single binary, so neithe
 Because a PKGBUILD *is* a bash script, building AUR packages requires `bash` and
 `makepkg`. Everything else is rvn's own code.
 
+### Installing without sudo: rvnd
+
+Installing needs root; typing a password for every install does not. `rvnd`
+is a small daemon that raven-init starts as root. It listens on
+`/run/rvn/ctl`, a socket only members of the `wheel` group can open, and runs
+the ordinary `rvn --json --yes ...` on their behalf with the connection as its
+stdout. An unprivileged `rvn install`, `uninstall`, `update` or `sync` sends
+one request line over that socket and replays the event stream through the
+same terminal interface, so it looks exactly like a run as root:
+
+```
+rvn install seatd libinput      # as yourself; no sudo, no password
+```
+
+In the terminal it is two phases. The daemon runs the operation with
+`--dry-run` and the plan is shown; once you say yes, it runs for real. Nothing
+on the wire is interactive, so the question is asked by the client. `--yes`
+skips the plan, `--dry-run` skips the apply, and `--json` relays the events
+verbatim in a single phase, which is what Raven Store reads.
+
+What crosses the socket is small and checked before anything runs: an
+operation name, a package list validated to package-name characters, and a
+handful of named flags. The configuration file is never the client's to
+choose; the daemon runs with the system's. AUR builds run as the requesting
+user, the account `sudo rvn` would have built as, so build trees stay yours.
+One transaction runs at a time; a second is told so rather than queued.
+
+Installing packages is root-equivalent, since hooks run as root, so the group
+has to be the administrators' group. What this buys is one auditable door and
+no password ceremony, not less power. The read-only commands (`find`, `info`,
+`list`, `owns`, `files`) never touch the daemon; they read databases anyone
+can read.
+
+Without a daemon `rvn` says so and behaves as it always has; with a daemon you
+are not allowed to use, it says which group to join. `RVN_SOCKET` points a
+client at another socket, for development. Rules for the daemon itself:
+
+```
+rvnd [--socket PATH] [--group NAME|none] [--rvn PATH]
+```
+
 ### Building From The AUR
 
 `rvn install <aur-package>` clones the build files, reads `.SRCINFO`, installs any

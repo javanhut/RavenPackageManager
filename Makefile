@@ -24,7 +24,8 @@ install: build
 	@echo "Installing $(BINARY) to $(BINDIR)..."
 	@install -d $(BINDIR)
 	@install -m 755 $(TARGET) $(BINDIR)/$(BINARY)
-	@echo "Installed $(BINARY) to $(BINDIR)/$(BINARY)"
+	@install -m 755 target/release/rvnd $(BINDIR)/rvnd
+	@echo "Installed $(BINARY) and rvnd to $(BINDIR)"
 	@echo "Run 'rvn --version' to verify."
 
 ## Uninstall rvn from $(PREFIX)/bin
