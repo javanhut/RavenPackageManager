@@ -35,8 +35,9 @@ alias = ["fmt", "f"]
 run = ["cargo fmt --all"]
 
 [commands.install]
-desc = "Install rvn to /usr/local/bin (may need sudo)"
+desc = "Install rvn to /usr/local/bin"
 dep = ["build"]
+escalate = true
 run = [
   "echo \"Installing {{binary}} to {{bindir}}...\"",
   "install -d {{bindir}}",
@@ -46,7 +47,8 @@ run = [
 ]
 
 [commands.uninstall]
-desc = "Uninstall rvn from /usr/local/bin (may need sudo)"
+desc = "Uninstall rvn from /usr/local/bin"
+escalate = true
 run = [
   "echo \"Removing {{bindir}}/{{binary}}...\"",
   "rm -f {{bindir}}/{{binary}}",
