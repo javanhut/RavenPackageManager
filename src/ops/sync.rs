@@ -191,14 +191,7 @@ fn user_copy_is_fresher(repos: &[String], system: &Path, user: &Path) -> bool {
 
 /// The per-user fallback sync directory: `$XDG_CACHE_HOME/rvn/sync`.
 fn user_sync_dir() -> Result<PathBuf, String> {
-    std::env::var_os("XDG_CACHE_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|v| !v.is_empty())
-                .map(|home| PathBuf::from(home).join(".cache"))
-        })
+    crate::db::index::cache_home()
         .map(|base| base.join("rvn").join("sync"))
         .ok_or_else(|| "cannot pick a per-user database directory: HOME is unset".to_string())
 }
@@ -332,8 +325,7 @@ fn verify_database(ctx: &Context, repo: &Repo, dest: &Path) -> Result<Verified, 
     }
 
     let keyring = ctx
-        .keyring
-        .as_ref()
+        .keyring()
         .ok_or("the pacman keyring could not be read, so the database signature \
                 cannot be checked")?;
 

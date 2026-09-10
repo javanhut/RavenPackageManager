@@ -4,7 +4,7 @@
 //! rvn downloads and parses these itself rather than delegating to pacman.
 
 use crate::config::{Config, Repo};
-use crate::db::desc;
+use crate::db::{desc, index};
 use crate::pkg::{Origin, Package};
 use flate2::read::GzDecoder;
 use std::collections::HashMap;
@@ -25,13 +25,17 @@ impl SyncDb {
         self.by_name.get(name).map(|&i| &self.packages[i])
     }
 
-    fn index(&mut self) {
-        self.by_name = self
-            .packages
+    fn from_packages(repo: &str, packages: Vec<Package>) -> SyncDb {
+        let by_name = packages
             .iter()
             .enumerate()
             .map(|(i, p)| (p.name.clone(), i))
             .collect();
+        SyncDb {
+            repo: repo.to_string(),
+            packages,
+            by_name,
+        }
     }
 
     /// Parses a decompressed `.db` tar stream.
@@ -88,19 +92,25 @@ impl SyncDb {
             })
             .collect();
 
-        let mut db = SyncDb {
-            repo: repo.to_string(),
-            packages,
-            by_name: HashMap::new(),
-        };
-        db.index();
-        Ok(db)
+        Ok(SyncDb::from_packages(repo, packages))
     }
 
     /// Loads a `.db` from disk, transparently gunzipping it.
+    ///
+    /// The parse is cached per database (see [`crate::db::index`]); a
+    /// database that has not changed since it was last read is not parsed
+    /// again.
     pub fn from_file(repo: &str, path: &Path) -> io::Result<SyncDb> {
+        if let Some(packages) = index::load(repo, path) {
+            return Ok(SyncDb::from_packages(repo, packages));
+        }
         let file = std::fs::File::open(path)?;
-        SyncDb::from_tar(repo, GzDecoder::new(io::BufReader::new(file)))
+        // Taken from the handle, not the path: a sync may rename a new
+        // database over this one while it is being parsed.
+        let stamp = index::stamp_of(&file.metadata()?);
+        let db = SyncDb::from_tar(repo, GzDecoder::new(io::BufReader::new(file)))?;
+        index::store(repo, path, stamp, &db.packages);
+        Ok(db)
     }
 }
 

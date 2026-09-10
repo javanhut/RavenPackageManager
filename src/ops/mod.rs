@@ -14,6 +14,7 @@ use crate::db::sync::SyncDb;
 use crate::ui::Ui;
 use crate::verify::Keyring;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 /// Shared state for a single rvn invocation.
 pub struct Context {
@@ -22,7 +23,10 @@ pub struct Context {
     pub sync: Vec<SyncDb>,
     pub aur: Aur,
     pub ui: Ui,
-    pub keyring: Option<Keyring>,
+    /// Read on first use: only signature checks need it, and parsing
+    /// pacman's keyring takes tens of milliseconds every other command
+    /// would pay for nothing.
+    keyring: OnceLock<Option<Keyring>>,
     /// Skip the AUR entirely.
     pub repo_only: bool,
     /// Resolve and report, but change nothing.
@@ -64,7 +68,6 @@ impl Context {
         let db_path_for_devel = config.db_path.clone();
         let local = LocalDb::load(&config.local_db_path());
         let (sync, _missing) = crate::db::sync::load_all(&config);
-        let keyring = Keyring::load(&config.gpg_dir).ok();
 
         Ok(Context {
             config,
@@ -72,7 +75,7 @@ impl Context {
             sync,
             aur: Aur::new(),
             ui,
-            keyring,
+            keyring: OnceLock::new(),
             repo_only: false,
             dry_run: false,
             assume_yes: false,
@@ -81,6 +84,13 @@ impl Context {
             devel: crate::devel::Registry::load(&db_path_for_devel),
             force_rebuild: Vec::new(),
         })
+    }
+
+    /// The pacman keyring, or `None` when it could not be read.
+    pub fn keyring(&self) -> Option<&Keyring> {
+        self.keyring
+            .get_or_init(|| Keyring::load(&self.config.gpg_dir).ok())
+            .as_ref()
     }
 
     /// Reloads the sync databases after a refresh.

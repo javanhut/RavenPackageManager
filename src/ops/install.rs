@@ -1103,7 +1103,7 @@ fn verify_one(ctx: &Context, pkg: &Package, path: &Path) -> Result<Verified, Str
         path,
         pkg.sha256.as_deref(),
         signature.as_deref(),
-        ctx.keyring.as_ref(),
+        ctx.keyring(),
         level,
     )
     .map_err(|e| e.to_string())

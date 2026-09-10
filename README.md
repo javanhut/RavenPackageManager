@@ -414,6 +414,11 @@ for the next command to read.
 Neither Arch nor Arch Linux ARM currently publishes `.db.sig` files, which is why
 the shipped configuration uses `DatabaseOptional`.
 
+Parsing `extra.db` takes a few hundred milliseconds, so rvn keeps a parsed copy of
+each database under `~/.cache/rvn/index` (`$XDG_CACHE_HOME` is honoured), keyed by
+the database's size and modification time. The copy is rebuilt on its own whenever
+the database changes or rvn is rebuilt, and deleting the directory is always safe.
+
 ## Machine-Readable Output
 
 `--json` turns every line of interface output into a JSON event on stdout, one
