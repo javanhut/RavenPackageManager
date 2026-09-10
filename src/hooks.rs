@@ -64,6 +64,7 @@ pub fn apply(root: &Path, files: &[String], warn: &mut impl FnMut(&str)) -> Appl
     for file in files {
         if file.starts_with("usr/lib/tmpfiles.d/")
             && file.ends_with(".conf")
+            && !tmpfiles_fragment_is_for_a_daemon_raven_never_runs(file)
             && let Ok(text) = std::fs::read_to_string(root.join(file))
         {
             apply_tmpfiles(root, &text, &mut applied, warn);
@@ -282,6 +283,26 @@ fn add_membership(root: &Path, user: &str, group: &str) -> std::io::Result<bool>
     Ok(changed)
 }
 
+/// Fragments that describe state for daemons Raven never starts.
+///
+/// Applying tmpfiles.d at install time stands in for systemd-tmpfiles at
+/// boot, so that a package's daemon finds its directories when raven-init
+/// starts it. systemd itself is installed only for libudev and udevd, and
+/// auditd is a dependency nobody enables; PID 1 is raven-init. Their
+/// fragments still declared /var/log/journal, /var/log/private and
+/// /var/log/audit, and every installed system carried three empty root-only
+/// directories that nothing on Raven would ever write to. The fragment file
+/// name is the package's own: `systemd*.conf` and the `20-systemd-*.conf`
+/// generators for systemd's components, `journal-nocow.conf` for journald,
+/// `audit.conf` for auditd.
+fn tmpfiles_fragment_is_for_a_daemon_raven_never_runs(file: &str) -> bool {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    name.starts_with("systemd")
+        || name.starts_with("20-systemd-")
+        || name == "journal-nocow.conf"
+        || name == "audit.conf"
+}
+
 fn apply_tmpfiles(root: &Path, text: &str, applied: &mut Applied, warn: &mut impl FnMut(&str)) {
     for line in text.lines().map(str::trim) {
         if line.is_empty() || line.starts_with('#') {
@@ -463,6 +484,51 @@ mod tests {
 
     /// openssh's actual tmpfiles fragment: without the factory copies there is
     /// no /etc/ssh/sshd_config and sshd refuses to start.
+    /// systemd's and auditd's fragments are skipped whole: their `d` lines
+    /// are state for daemons that never run under raven-init.
+    #[test]
+    fn tmpfiles_fragments_of_daemons_raven_never_runs_are_skipped() {
+        for skipped in [
+            "usr/lib/tmpfiles.d/systemd.conf",
+            "usr/lib/tmpfiles.d/systemd-network.conf",
+            "usr/lib/tmpfiles.d/20-systemd-userdb.conf",
+            "usr/lib/tmpfiles.d/journal-nocow.conf",
+            "usr/lib/tmpfiles.d/audit.conf",
+        ] {
+            assert!(tmpfiles_fragment_is_for_a_daemon_raven_never_runs(skipped), "{skipped}");
+        }
+        for kept in [
+            "usr/lib/tmpfiles.d/dbus.conf",
+            "usr/lib/tmpfiles.d/arch.conf",
+            "usr/lib/tmpfiles.d/sudo.conf",
+            "usr/lib/tmpfiles.d/x11.conf",
+            "usr/lib/tmpfiles.d/openssh.conf",
+        ] {
+            assert!(!tmpfiles_fragment_is_for_a_daemon_raven_never_runs(kept), "{kept}");
+        }
+        // And through the front door: a systemd fragment creates nothing.
+        let root = root("tmpfiles-skip");
+        std::fs::create_dir_all(root.join("usr/lib/tmpfiles.d")).unwrap();
+        std::fs::write(
+            root.join("usr/lib/tmpfiles.d/systemd.conf"),
+            "d /var/log/private 0700 root root -\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("usr/lib/tmpfiles.d/dbus.conf"),
+            "d /run/dbus 0755 root root -\n",
+        )
+        .unwrap();
+        let applied = apply(
+            &root,
+            &["usr/lib/tmpfiles.d/systemd.conf".to_string(), "usr/lib/tmpfiles.d/dbus.conf".to_string()],
+            &mut |_| {},
+        );
+        assert!(!root.join("var/log/private").exists(), "systemd's fragment must be skipped");
+        assert!(root.join("run/dbus").is_dir(), "dbus's fragment still applies");
+        assert_eq!(applied.directories, vec!["/run/dbus".to_string()]);
+    }
+
     #[test]
     fn tmpfiles_copies_factory_defaults_only_where_nothing_exists() {
         let root = root("tmpfiles-c");

@@ -41,6 +41,9 @@ pub struct Context {
     pub devel: crate::devel::Registry,
     /// Packages to reinstall even if their version already matches.
     pub force_rebuild: Vec<String>,
+    /// `rvn --user`: installing into the caller's own prefix. No root, so no
+    /// scriptlets and no hooks, and nothing goes through rvnd.
+    pub user_prefix: Option<crate::config::UserPrefix>,
 }
 
 impl Context {
@@ -65,11 +68,16 @@ impl Context {
                 ));
             }
         };
+        Ok(Self::from_config(config, ui))
+    }
+
+    /// A context over an already-built configuration.
+    pub fn from_config(config: Config, ui: Ui) -> Context {
         let db_path_for_devel = config.db_path.clone();
         let local = LocalDb::load(&config.local_db_path());
         let (sync, _missing) = crate::db::sync::load_all(&config);
 
-        Ok(Context {
+        Context {
             config,
             local,
             sync,
@@ -83,7 +91,8 @@ impl Context {
             auto_sync: true,
             devel: crate::devel::Registry::load(&db_path_for_devel),
             force_rebuild: Vec::new(),
-        })
+            user_prefix: None,
+        }
     }
 
     /// The pacman keyring, or `None` when it could not be read.

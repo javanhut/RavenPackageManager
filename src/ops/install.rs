@@ -62,7 +62,26 @@ pub struct Outcome {
 /// Runs `rvn install`, including the masthead.
 pub fn run(ctx: &mut Context, targets: &[String]) -> Result<Outcome, String> {
     ctx.ui.banner(&format!("v{}", env!("CARGO_PKG_VERSION")));
-    execute(ctx, targets)
+    let outcome = execute(ctx, targets)?;
+    if let Some(prefix) = &ctx.user_prefix
+        && !outcome.installed.is_empty()
+    {
+        // Honest about the shape of a per-user prefix: programs work when
+        // they are on the PATH; anything that hard-codes /usr does not.
+        ctx.ui.info(&format!(
+            "installed under {}; programs are in {}",
+            prefix.root.display(),
+            prefix.bin_dir().display()
+        ));
+        ctx.ui.detail(&format!(
+            "put it on your PATH once: raven-add path {}",
+            prefix.bin_dir().display()
+        ));
+        ctx.ui.detail(
+            "self-contained tools work from there; a package that hard-codes /usr (libraries, data, D-Bus services) does not, and needs a system install",
+        );
+    }
+    Ok(outcome)
 }
 
 /// The install pipeline without the masthead, so other operations — notably
@@ -520,6 +539,18 @@ pub(crate) fn run_scriptlet(
         return;
     };
 
+    // A scriptlet runs in a chroot of the install root, which needs root;
+    // a per-user prefix has neither. The files are in place; what the
+    // scriptlet would have done (caches, users, module indexes) is not, and
+    // saying so once per package beats a chroot error per hook.
+    if ctx.user_prefix.is_some() {
+        ctx.ui.detail(&format!(
+            "{package}: {} skipped (per-user prefix, no root)",
+            hook.function()
+        ));
+        return;
+    }
+
     match scriptlet::run(
         &ctx.config.root_dir,
         package,
@@ -795,7 +826,10 @@ fn install_archives(
         // its missing user or missing config -- and the fix lands on the
         // operator, who was promised the installation would do it.
         let mut warnings = Vec::new();
-        let applied = crate::hooks::apply(&ctx.config.root_dir, &files, &mut |w| {
+        // sysusers needs root and tmpfiles describe system daemons; a
+        // per-user prefix has neither, so its packages get no hooks.
+        let hook_files: &[String] = if ctx.user_prefix.is_some() { &[] } else { &files };
+        let applied = crate::hooks::apply(&ctx.config.root_dir, hook_files, &mut |w| {
             warnings.push(w.to_string())
         });
         for warning in &warnings {

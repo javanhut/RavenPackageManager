@@ -62,6 +62,13 @@ fn cli() -> Command {
                 .help("Emit machine-readable JSON events on stdout (for front-ends)"),
         )
         .arg(
+            Arg::new("user")
+                .long("user")
+                .global(true)
+                .action(ArgAction::SetTrue)
+                .help("Install into your own prefix (~/.local/share/rvn/root), without root"),
+        )
+        .arg(
             Arg::new("no-sync")
                 .long("no-sync")
                 .global(true)
@@ -215,7 +222,7 @@ fn cli() -> Command {
 fn via_daemon(matches: &ArgMatches, sub: &ArgMatches, mut req: rvn::daemon::Request) -> Option<Result<(), String>> {
     use rvn::daemon::{Reach, reach, request, Replay, SOCKET_PATH};
 
-    if ops::is_root() {
+    if ops::is_root() || matches.get_flag("user") {
         return None;
     }
     if matches
@@ -232,9 +239,17 @@ fn via_daemon(matches: &ArgMatches, sub: &ArgMatches, mut req: rvn::daemon::Requ
     match reach(socket) {
         Reach::Ok => {}
         Reach::Absent => {
-            if !json {
-                Ui::new().warn("rvnd is not running, so this needs root: `sudo rvn ...`, or `sudo raven-rc start rvnd`");
+            // In a terminal this is a warning and the in-process path goes
+            // on to fail at the first write, with root's advice printed
+            // first. A front-end reading JSON has no terminal to read that
+            // warning on, so it gets the same advice as the failure itself
+            // rather than a later, worse one about a read-only database.
+            if json {
+                return Some(Err(
+                    "rvnd is not running, so installing needs root: start it with `sudo raven-rc start rvnd`, or use `sudo rvn` in a terminal".into(),
+                ));
             }
+            Ui::new().warn("rvnd is not running, so this needs root: `sudo rvn ...`, or `sudo raven-rc start rvnd`");
             return None;
         }
         Reach::Denied => {
@@ -307,7 +322,20 @@ fn build_context(matches: &ArgMatches, sub: &ArgMatches) -> Result<Context, Stri
     } else {
         Ui::new()
     };
-    let mut ctx = Context::load(&config_path, ui).map_err(|e| e.to_string())?;
+    let mut ctx = if matches.get_flag("user") {
+        // The system configuration for repositories and keys; the user's own
+        // directories for everything written.
+        let mut config = rvn::config::Config::load(&config_path)
+            .map_err(|e| format!("{}: {e}", config_path.display()))?;
+        let prefix = rvn::config::UserPrefix::from_env()
+            .ok_or("--user needs HOME to be set")?;
+        config.use_prefix(&prefix).map_err(|e| format!("cannot create the user prefix: {e}"))?;
+        let mut ctx = Context::from_config(config, ui);
+        ctx.user_prefix = Some(prefix);
+        ctx
+    } else {
+        Context::load(&config_path, ui).map_err(|e| e.to_string())?
+    };
     ctx.repo_only = matches.get_flag("repo-only");
     ctx.assume_yes = matches.get_flag("yes");
     ctx.keep_cache = matches.get_flag("keep-cache");

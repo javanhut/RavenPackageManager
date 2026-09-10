@@ -68,6 +68,28 @@ client at another socket, for development. Rules for the daemon itself:
 rvnd [--socket PATH] [--group NAME|none] [--rvn PATH]
 ```
 
+### Your own prefix: `rvn --user`
+
+`rvn --user install foo` installs into a prefix you own, with no root and no
+daemon: packages unpack under `~/.local/share/rvn/root`, the record of what is
+installed lives in `~/.local/share/rvn/db`, downloads in `~/.cache/rvn/pkg`.
+Repositories, mirrors and the keyring are the system's; the repository
+databases are the per-user copy rvn keeps for unprivileged refreshes, seeded
+from the system's the first time, so a fresh prefix resolves offline at once
+and `rvn --user sync` refreshes it without asking anyone.
+
+```
+rvn --user install ripgrep
+raven-add path ~/.local/share/rvn/root/usr/bin     # once
+rvn --user list
+```
+
+What it is honest about: a package's scriptlets and hooks do not run (they
+need a chroot and root), and a program that hard-codes `/usr` for its
+libraries, data or D-Bus services will not find them under the prefix.
+Self-contained tools work; a desktop application generally does not, and
+needs a system install through rvnd.
+
 ### Building From The AUR
 
 `rvn install <aur-package>` clones the build files, reads `.SRCINFO`, installs any

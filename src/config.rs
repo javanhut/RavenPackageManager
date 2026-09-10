@@ -126,6 +126,78 @@ impl Default for Config {
 }
 
 /// The machine architecture, matching what pacman substitutes for `$arch`.
+/// The directories of a per-user install, under the XDG base directories.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserPrefix {
+    /// Where packages are unpacked: `$XDG_DATA_HOME/rvn/root`, so a package's
+    /// `/usr/bin/foo` lands at `<root>/usr/bin/foo`.
+    pub root: PathBuf,
+    /// The local database of what is installed there.
+    pub db: PathBuf,
+    /// Downloaded packages.
+    pub cache: PathBuf,
+}
+
+impl UserPrefix {
+    /// From the environment; `None` when there is no HOME to build on.
+    pub fn from_env() -> Option<UserPrefix> {
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        let data = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share"));
+        let cache = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".cache"));
+        Some(UserPrefix {
+            root: data.join("rvn/root"),
+            db: data.join("rvn/db"),
+            cache: cache.join("rvn/pkg"),
+        })
+    }
+
+    /// Where the prefix's programs are, for the PATH advice.
+    pub fn bin_dir(&self) -> PathBuf {
+        self.root.join("usr/bin")
+    }
+}
+
+impl Config {
+    /// Point this configuration at a user's own prefix, keeping the
+    /// repositories, mirrors and keyring of the system configuration it was
+    /// read from. The directories are created so the first install has
+    /// somewhere to write.
+    ///
+    /// The repository databases are the per-user copy rvn already keeps for
+    /// unprivileged refreshes (`$XDG_CACHE_HOME/rvn/sync`), seeded from the
+    /// system's databases the first time so a prefix works offline at once
+    /// and `rvn --user sync` has somewhere it may write.
+    pub fn use_prefix(&mut self, prefix: &UserPrefix) -> std::io::Result<()> {
+        for dir in [&prefix.root, &prefix.db.join("local"), &prefix.cache] {
+            std::fs::create_dir_all(dir)?;
+        }
+        let system_sync = self.sync_db_path();
+        let user_sync = crate::db::index::cache_home()
+            .map(|c| c.join("rvn/sync"))
+            .unwrap_or_else(|| prefix.db.join("sync"));
+        std::fs::create_dir_all(&user_sync)?;
+        for repo in &self.repos {
+            for ext in ["db", "db.sig"] {
+                let name = format!("{}.{ext}", repo.name);
+                let theirs = user_sync.join(&name);
+                let ours = system_sync.join(&name);
+                if !theirs.exists() && ours.is_file() {
+                    std::fs::copy(&ours, &theirs)?;
+                }
+            }
+        }
+        self.sync_dir_override = Some(user_sync);
+        self.root_dir = prefix.root.clone();
+        self.db_path = prefix.db.clone();
+        self.cache_dirs = vec![prefix.cache.clone()];
+        Ok(())
+    }
+}
+
 pub fn detect_arch() -> String {
     if cfg!(target_arch = "x86_64") {
         "x86_64".to_string()
@@ -360,6 +432,65 @@ pub fn repo_map(cfg: &Config) -> HashMap<&str, &Repo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_user_prefix_follows_the_xdg_directories() {
+        // SAFETY: this test is the only thing in the process reading these
+        // variables while it runs; the suite does not run env tests in parallel.
+        unsafe {
+            std::env::set_var("HOME", "/home/x");
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("XDG_CACHE_HOME");
+        }
+        let p = UserPrefix::from_env().unwrap();
+        assert_eq!(p.root, PathBuf::from("/home/x/.local/share/rvn/root"));
+        assert_eq!(p.db, PathBuf::from("/home/x/.local/share/rvn/db"));
+        assert_eq!(p.cache, PathBuf::from("/home/x/.cache/rvn/pkg"));
+        assert_eq!(p.bin_dir(), PathBuf::from("/home/x/.local/share/rvn/root/usr/bin"));
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", "/data");
+            std::env::set_var("XDG_CACHE_HOME", "/cache");
+        }
+        let p = UserPrefix::from_env().unwrap();
+        assert_eq!(p.root, PathBuf::from("/data/rvn/root"));
+        assert_eq!(p.cache, PathBuf::from("/cache/rvn/pkg"));
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("XDG_CACHE_HOME");
+        }
+    }
+
+    #[test]
+    fn use_prefix_redirects_every_written_path_and_keeps_repos() {
+        let dir = std::env::temp_dir().join(format!("rvn-prefix-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let prefix = UserPrefix { root: dir.join("root"), db: dir.join("db"), cache: dir.join("pkg") };
+        // A system sync directory with one database, and a cache home of
+        // our own so the per-user copy lands in the temp dir.
+        let system_sync = dir.join("system-sync");
+        std::fs::create_dir_all(&system_sync).unwrap();
+        std::fs::write(system_sync.join("extra.db"), b"not really a db").unwrap();
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        }
+        let mut cfg = Config::default();
+        cfg.sync_dir_override = Some(system_sync.clone());
+        cfg.repos.push(Repo { name: "extra".into(), servers: vec!["https://mirror/extra".into()], siglevel: SigLevel::default_level() });
+        cfg.use_prefix(&prefix).unwrap();
+        assert_eq!(cfg.root_dir, prefix.root);
+        assert_eq!(cfg.db_path, prefix.db);
+        assert_eq!(cfg.cache_dirs, vec![prefix.cache.clone()]);
+        assert_eq!(cfg.repos.len(), 1, "repositories come from the system config");
+        assert!(prefix.db.join("local").is_dir(), "the local db dir exists for the first install");
+        assert_eq!(cfg.gpg_dir, PathBuf::from("/etc/pacman.d/gnupg"), "the keyring is the system one");
+        let user_sync = dir.join("cache/rvn/sync");
+        assert_eq!(cfg.sync_db_path(), user_sync, "databases are read from the per-user copy");
+        assert_eq!(std::fs::read(user_sync.join("extra.db")).unwrap(), b"not really a db", "seeded from the system copy");
+        unsafe {
+            std::env::remove_var("XDG_CACHE_HOME");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
     use std::io::Write;
 
     fn write_temp(name: &str, contents: &str) -> PathBuf {
