@@ -99,6 +99,11 @@ pub struct Config {
     pub arch: Vec<String>,
     pub repos: Vec<Repo>,
     pub ignore_pkg: Vec<String>,
+    /// Packages rvn refuses to remove, per `HoldPkg`. Without the setting
+    /// this is pacman's stock `HoldPkg = pacman glibc`.
+    pub hold_pkg: Vec<String>,
+    /// Where removals are recorded, per `LogFile`.
+    pub log_file: PathBuf,
     pub parallel_downloads: usize,
     pub color: bool,
     /// Redirects the sync databases away from `db_path/sync` for this
@@ -118,6 +123,8 @@ impl Default for Config {
             arch: vec![detect_arch()],
             repos: Vec::new(),
             ignore_pkg: Vec::new(),
+            hold_pkg: vec!["pacman".to_string(), "glibc".to_string()],
+            log_file: PathBuf::from("/var/log/pacman.log"),
             parallel_downloads: 5,
             color: true,
             sync_dir_override: None,
@@ -194,6 +201,9 @@ impl Config {
         self.root_dir = prefix.root.clone();
         self.db_path = prefix.db.clone();
         self.cache_dirs = vec![prefix.cache.clone()];
+        // An unprivileged prefix cannot write the system log, and its
+        // removals are not the system's to record anyway.
+        self.log_file = prefix.db.join("rvn.log");
         Ok(())
     }
 }
@@ -227,6 +237,9 @@ impl Config {
     pub fn load(path: &Path) -> io::Result<Config> {
         let mut cfg = Config::default();
         let mut arch_from_file: Option<Vec<String>> = None;
+        // Setting HoldPkg at all replaces the default rather than adding to
+        // it, so an empty-looking configuration can still opt out.
+        let mut hold_from_file: Option<Vec<String>> = None;
         // Section name -> raw key/value pairs, preserving repeats.
         let mut sections: Vec<(String, Vec<(String, String)>)> = Vec::new();
         let mut current = String::from("options");
@@ -265,6 +278,10 @@ impl Config {
                         "IgnorePkg" => cfg
                             .ignore_pkg
                             .extend(value.split_whitespace().map(str::to_string)),
+                        "HoldPkg" => hold_from_file
+                            .get_or_insert_with(Vec::new)
+                            .extend(value.split_whitespace().map(str::to_string)),
+                        "LogFile" => cfg.log_file = PathBuf::from(value),
                         "ParallelDownloads" => {
                             if let Ok(n) = value.trim().parse::<usize>() {
                                 cfg.parallel_downloads = n.max(1);
@@ -276,6 +293,10 @@ impl Config {
                     }
                 }
             }
+        }
+
+        if let Some(hold) = hold_from_file {
+            cfg.hold_pkg = hold;
         }
 
         if let Some(arch) = arch_from_file {
@@ -498,6 +519,23 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(contents.as_bytes()).unwrap();
         path
+    }
+
+    #[test]
+    fn hold_pkg_defaults_to_pacmans_and_is_replaced_when_set() {
+        let unset = write_temp("hold-unset.conf", "[options]\nDBPath = /var/lib/pacman/\n");
+        let cfg = Config::load(&unset).unwrap();
+        assert_eq!(cfg.hold_pkg, vec!["pacman", "glibc"]);
+        assert_eq!(cfg.log_file, PathBuf::from("/var/log/pacman.log"));
+
+        let set = write_temp(
+            "hold-set.conf",
+            "[options]\nHoldPkg = rvn glibc\nHoldPkg = sudo\nLogFile = /var/log/rvn.log\n",
+        );
+        let cfg = Config::load(&set).unwrap();
+        // Replaces the default rather than adding pacman back in.
+        assert_eq!(cfg.hold_pkg, vec!["rvn", "glibc", "sudo"]);
+        assert_eq!(cfg.log_file, PathBuf::from("/var/log/rvn.log"));
     }
 
     #[test]

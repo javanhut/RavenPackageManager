@@ -163,10 +163,22 @@ pub fn plan(local: &LocalDb, targets: &[String], options: Options) -> RemovalPla
 
     if options.recursive {
         loop {
+            // Only what the removal set itself depends on can be orphaned by
+            // it. A package that was already unneeded before this removal is
+            // not this removal's to take: scanning the whole database is how
+            // uninstalling a notification daemon swept away sudo, pacman and
+            // tar, which an earlier AUR build had left recorded as
+            // dependencies that nothing required.
+            let wanted: Vec<&crate::pkg::Dep> = removing
+                .iter()
+                .filter_map(|name| local.get(name))
+                .flat_map(|pkg| pkg.depends.iter())
+                .collect();
             let additions: Vec<String> = local
                 .packages
                 .values()
                 .filter(|pkg| !removing.contains(&pkg.name))
+                .filter(|pkg| wanted.iter().any(|&dep| pkg.satisfies(dep)))
                 .filter(|pkg| is_orphan(local, pkg, &removing))
                 .map(|pkg| pkg.name.clone())
                 .collect();
@@ -386,6 +398,55 @@ mod tests {
                 pkg("app", &["tool"], InstallReason::Explicit),
                 // Installed on purpose, so it must survive even when unused.
                 pkg("tool", &[], InstallReason::Explicit),
+            ],
+        );
+        let plan = plan(
+            &local,
+            &["app".into()],
+            Options {
+                recursive: true,
+                ..Default::default()
+            },
+        );
+        assert!(plan.orphaned.is_empty());
+        assert_eq!(names(&plan), vec!["app"]);
+    }
+
+    #[test]
+    fn recursive_leaves_unrelated_orphans_alone() {
+        let local = db(
+            "unrelated-orphans",
+            vec![
+                pkg("mako", &["libfoo"], InstallReason::Explicit),
+                pkg("libfoo", &[], InstallReason::Dependency),
+                // Left behind by an AUR build: recorded as dependencies, and
+                // required by nothing long before mako is removed.
+                pkg("base-devel", &["sudo", "pacman"], InstallReason::Dependency),
+                pkg("sudo", &[], InstallReason::Dependency),
+                pkg("pacman", &[], InstallReason::Dependency),
+            ],
+        );
+        let plan = plan(
+            &local,
+            &["mako".into()],
+            Options {
+                recursive: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(plan.orphaned, vec!["libfoo"]);
+        assert_eq!(names(&plan), vec!["mako", "libfoo"]);
+    }
+
+    #[test]
+    fn recursive_keeps_a_dependency_something_else_needs() {
+        let local = db(
+            "shared-dep",
+            vec![
+                pkg("app", &["libfoo"], InstallReason::Explicit),
+                pkg("other", &["libfoo"], InstallReason::Explicit),
+                pkg("libfoo", &[], InstallReason::Dependency),
             ],
         );
         let plan = plan(

@@ -674,13 +674,29 @@ fn install_archives(
             // /lib64 and /sbin as symlinks into /usr, and a split-usr root has
             // them as real directories. Saying so beats leaving the reader to
             // work out what to do with "bin would be a symlink to usr/bin".
-            if conflicts
+            // Anywhere else it is a directory in the package's way -- blaming
+            // usrmerge for firmware directories sent the reader the wrong way.
+            const LAYOUT: &[&str] = &["bin", "lib", "lib64", "sbin", "usr/lib64", "usr/sbin"];
+            let (layout, elsewhere): (Vec<_>, Vec<_>) = conflicts
                 .iter()
-                .any(|c| matches!(c, extract::ExtractError::TypeConflict { .. }))
-            {
+                .filter_map(|c| match c {
+                    extract::ExtractError::TypeConflict { path, .. } => {
+                        Some(path.trim_end_matches('/'))
+                    }
+                    _ => None,
+                })
+                .partition(|path| LAYOUT.contains(path));
+            if !layout.is_empty() {
                 lines.push(
                     "this root is not usr-merged; convert it with \
                      scripts/usrmerge-rootfs.sh, then retry"
+                        .to_string(),
+                );
+            }
+            if !elsewhere.is_empty() {
+                lines.push(
+                    "if no installed package owns what is in the way, \
+                     move it aside, then retry"
                         .to_string(),
                 );
             }
@@ -785,9 +801,21 @@ fn install_archives(
         record.backup = manifest
             .backup
             .iter()
-            .map(|path| BackupFile {
-                path: path.clone(),
-                hash: crate::verify::sha256_file(&ctx.config.root_dir.join(path)).ok(),
+            .map(|path| {
+                // Where the disk copy was spared, what is on disk is not the
+                // package's. Recording its hash made removal see the admin's
+                // file as untouched package content and delete it -- which is
+                // how Raven's /etc/pam.d/sudo went with the sudo package.
+                // pacman records what the package shipped, and so does this.
+                let shipped = if pacnew.contains(path) {
+                    ctx.config.root_dir.join(format!("{path}.pacnew"))
+                } else {
+                    ctx.config.root_dir.join(path)
+                };
+                BackupFile {
+                    path: path.clone(),
+                    hash: crate::verify::sha256_file(&shipped).ok(),
+                }
             })
             .collect();
         record.validation = validations

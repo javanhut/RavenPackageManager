@@ -69,6 +69,28 @@ pub fn execute(
         return Err("removal blocked by reverse dependencies".into());
     }
 
+    // HoldPkg names what must not be removed. pacman asks first; rvn refuses
+    // outright, because `--yes` and rvnd would answer that question without
+    // anyone reading it.
+    let held: Vec<String> = plan
+        .remove
+        .iter()
+        .map(|pkg| pkg.name.clone())
+        .filter(|name| ctx.config.hold_pkg.contains(name))
+        .collect();
+    if !held.is_empty() {
+        ctx.ui.err("removal would take held packages (HoldPkg):");
+        ctx.ui.tree(&held);
+        if held.iter().all(|name| plan.orphaned.contains(name)) {
+            ctx.ui
+                .info("they are only here as orphans: use --keep-orphans to leave them");
+        } else {
+            ctx.ui
+                .info("remove them from HoldPkg in pacman.conf to allow this");
+        }
+        return Err("removal includes held packages".into());
+    }
+
     if plan.is_empty() {
         ctx.ui.info("nothing to remove");
         return Ok(Outcome {
@@ -114,6 +136,7 @@ pub fn apply(ctx: &mut Context, plan: &RemovalPlan) -> Result<Outcome, String> {
     let mut progress = ctx.ui.counter("removing", total_files, "files");
     let mut removed = Vec::new();
     let mut preserved = Vec::new();
+    let mut log_failed = false;
     let mut touched_dirs: HashSet<PathBuf> = HashSet::new();
 
     for pkg in &plan.remove {
@@ -187,6 +210,18 @@ pub fn apply(ctx: &mut Context, plan: &RemovalPlan) -> Result<Outcome, String> {
         ctx.devel.forget(&pkg.name);
 
         removed.push(pkg.name.clone());
+
+        // Logged as each package goes, so a removal that fails part-way still
+        // leaves a record of what it had already taken.
+        if let Err(e) = log_removed(&ctx.config.log_file, &pkg.name, &pkg.version, now_unix()) {
+            if !log_failed {
+                ctx.ui.warn(&format!(
+                    "could not record removals in {}: {e}",
+                    ctx.config.log_file.display()
+                ));
+            }
+            log_failed = true;
+        }
     }
 
     progress.finish(&format!(
@@ -233,6 +268,18 @@ pub fn apply(ctx: &mut Context, plan: &RemovalPlan) -> Result<Outcome, String> {
 /// treated as modified — losing an edit is far worse than leaving a stray
 /// `.pacsave` behind.
 fn was_modified(pkg: &crate::pkg::Package, file: &str, path: &Path) -> bool {
+    // A `.pacnew` beside it means the install found this file already there
+    // and kept it. Older records hashed that kept file rather than the
+    // package's copy, so the checksum would call it untouched.
+    let pacnew = path.with_file_name(format!(
+        "{}.pacnew",
+        path.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default()
+    ));
+    if pacnew.exists() {
+        return true;
+    }
     let Some(original) = pkg.backup_hash(file) else {
         return true;
     };
@@ -240,6 +287,55 @@ fn was_modified(pkg: &crate::pkg::Package, file: &str, path: &Path) -> bool {
         Ok(current) => !current.eq_ignore_ascii_case(original),
         Err(_) => true,
     }
+}
+
+/// Appends one removal to `LogFile`, in pacman.log's layout so whatever reads
+/// that file reads this too. Nothing else records what an uninstall took, and
+/// without it the only way to learn what an orphan sweep removed was to
+/// reconstruct it from the package cache.
+fn log_removed(log: &Path, name: &str, version: &str, when: u64) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = log.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)?;
+    writeln!(
+        file,
+        "[{}] [RVN] removed {name} ({version})",
+        timestamp(when)
+    )
+}
+
+/// Seconds since the epoch, or 0 if the clock is before it.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Seconds since the epoch as pacman.log's `YYYY-MM-DDTHH:MM:SS+0000`, in UTC.
+fn timestamp(secs: u64) -> String {
+    // Civil date from a day count: Howard Hinnant's civil_from_days.
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let rem = secs % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}+0000",
+        rem / 3600,
+        rem / 60 % 60,
+        rem % 60
+    )
 }
 
 /// Removes directories that the removal emptied, deepest first so parents
@@ -337,6 +433,55 @@ mod tests {
             ..Default::default()
         };
         assert!(was_modified(&hashless, "etc/demo.conf", &path));
+    }
+
+    #[test]
+    fn a_config_kept_beside_a_pacnew_is_preserved_despite_its_hash() {
+        use crate::pkg::{BackupFile, Package};
+
+        let dir = std::env::temp_dir().join("rvn-backup-pacnew");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sudo");
+        std::fs::write(&path, b"raven's own stack").unwrap();
+
+        // What an older rvn recorded: the hash of the file it kept, which
+        // makes that file look like untouched package content.
+        let pkg = Package {
+            backup: vec![BackupFile {
+                path: "etc/pam.d/sudo".into(),
+                hash: Some(crate::verify::sha256_file(&path).unwrap()),
+            }],
+            ..Default::default()
+        };
+        assert!(!was_modified(&pkg, "etc/pam.d/sudo", &path));
+
+        std::fs::write(dir.join("sudo.pacnew"), b"arch's stack").unwrap();
+        assert!(was_modified(&pkg, "etc/pam.d/sudo", &path));
+    }
+
+    #[test]
+    fn timestamps_match_pacman_log() {
+        assert_eq!(timestamp(0), "1970-01-01T00:00:00+0000");
+        // A leap day, which is where a hand-rolled calendar goes wrong.
+        assert_eq!(timestamp(951_782_400), "2000-02-29T00:00:00+0000");
+        assert_eq!(timestamp(1_789_504_157), "2026-09-15T20:29:17+0000");
+    }
+
+    #[test]
+    fn removals_are_appended_to_the_log() {
+        let dir = std::env::temp_dir().join("rvn-remove-log");
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = dir.join("log/pacman.log");
+
+        log_removed(&log, "mako", "1.9.0-1", 0).unwrap();
+        log_removed(&log, "libfoo", "2-1", 60).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "[1970-01-01T00:00:00+0000] [RVN] removed mako (1.9.0-1)\n\
+             [1970-01-01T00:01:00+0000] [RVN] removed libfoo (2-1)\n"
+        );
     }
 
     #[test]

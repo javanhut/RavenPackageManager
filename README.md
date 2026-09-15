@@ -288,8 +288,12 @@ rvn refuses a removal that would break something else, and says what:
   •  use --cascade to remove the dependents too, or --nodeps to force
 ```
 
-Dependencies that nothing else needs are removed along with the target, so
-uninstalling does not silently leave a system full of orphans.
+Dependencies of the target that nothing else needs are removed along with it, so
+uninstalling does not silently leave a system full of orphans. Only the target's own
+dependency chain is considered: a package that was already unneeded before the
+removal is left alone. Packages listed in `HoldPkg` (`pacman glibc` when unset) are
+never removed, and every removal is recorded in `LogFile` (`/var/log/pacman.log`
+by default).
 
 | Option | Effect |
 | --- | --- |
