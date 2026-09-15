@@ -17,6 +17,35 @@ pub struct Options {
     pub recursive: bool,
     /// Remove regardless of what would break.
     pub nodeps: bool,
+    /// The caller has seen the orphans and wants them gone. Required for an
+    /// orphan sweep under `--yes`, where nobody is asked.
+    pub remove_orphans: bool,
+}
+
+/// What Raven needs to log in, become root and install its way back, held
+/// whatever `HoldPkg` says: an unset or trimmed `HoldPkg` must not be what
+/// lets an uninstall take sudo or tar. rvn itself is statically linked with
+/// its own certificates and decompressors, so it needs nothing more.
+pub const ESSENTIAL: &[&str] = &[
+    "filesystem",
+    "glibc",
+    "bash",
+    "coreutils",
+    "util-linux",
+    "shadow",
+    "pam",
+    "sudo",
+    "pacman",
+    "tar",
+];
+
+/// Packages in `plan` that are held: essential, or named by `HoldPkg`.
+pub fn held(plan: &RemovalPlan, hold_pkg: &[String]) -> Vec<String> {
+    plan.remove
+        .iter()
+        .map(|pkg| pkg.name.clone())
+        .filter(|name| ESSENTIAL.contains(&name.as_str()) || hold_pkg.contains(name))
+        .collect()
 }
 
 /// A package that cannot be removed because something still needs it.
@@ -437,6 +466,38 @@ mod tests {
 
         assert_eq!(plan.orphaned, vec!["libfoo"]);
         assert_eq!(names(&plan), vec!["mako", "libfoo"]);
+    }
+
+    #[test]
+    fn essential_packages_are_held_even_without_hold_pkg() {
+        let local = db(
+            "held",
+            vec![
+                pkg("base-devel", &["sudo", "make", "glibc"], InstallReason::Explicit),
+                pkg("sudo", &[], InstallReason::Dependency),
+                pkg("make", &[], InstallReason::Dependency),
+                pkg("glibc", &[], InstallReason::Dependency),
+            ],
+        );
+        let plan = plan(
+            &local,
+            &["base-devel".into()],
+            Options {
+                recursive: true,
+                ..Default::default()
+            },
+        );
+        // The plan still finds them; holding is what refuses it.
+        assert_eq!(plan.orphaned, vec!["glibc", "make", "sudo"]);
+
+        let mut held_names = held(&plan, &[]);
+        held_names.sort();
+        assert_eq!(held_names, vec!["glibc", "sudo"]);
+
+        // HoldPkg adds to the essentials; it cannot take them away.
+        let mut with_config = held(&plan, &["make".to_string()]);
+        with_config.sort();
+        assert_eq!(with_config, vec!["glibc", "make", "sudo"]);
     }
 
     #[test]

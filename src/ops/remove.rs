@@ -69,28 +69,6 @@ pub fn execute(
         return Err("removal blocked by reverse dependencies".into());
     }
 
-    // HoldPkg names what must not be removed. pacman asks first; rvn refuses
-    // outright, because `--yes` and rvnd would answer that question without
-    // anyone reading it.
-    let held: Vec<String> = plan
-        .remove
-        .iter()
-        .map(|pkg| pkg.name.clone())
-        .filter(|name| ctx.config.hold_pkg.contains(name))
-        .collect();
-    if !held.is_empty() {
-        ctx.ui.err("removal would take held packages (HoldPkg):");
-        ctx.ui.tree(&held);
-        if held.iter().all(|name| plan.orphaned.contains(name)) {
-            ctx.ui
-                .info("they are only here as orphans: use --keep-orphans to leave them");
-        } else {
-            ctx.ui
-                .info("remove them from HoldPkg in pacman.conf to allow this");
-        }
-        return Err("removal includes held packages".into());
-    }
-
     if plan.is_empty() {
         ctx.ui.info("nothing to remove");
         return Ok(Outcome {
@@ -109,12 +87,62 @@ pub fn execute(
     );
     show_plan(ctx, &plan);
 
+    // Held packages -- essential to Raven, or named by HoldPkg -- are never
+    // taken as a side effect of removing something else. Named outright, a
+    // person at a terminal may still confirm it, as pacman lets them; `--yes`
+    // and rvnd would answer that question without anyone reading it.
+    let (held_targets, held_side): (Vec<String>, Vec<String>) =
+        remove::held(&plan, &ctx.config.hold_pkg)
+            .into_iter()
+            .partition(|name| targets.contains(name));
+    if !held_side.is_empty() {
+        ctx.ui
+            .err("removal would take held packages that were not named:");
+        ctx.ui.tree(&held_side);
+        if held_side.iter().any(|name| plan.orphaned.contains(name)) {
+            ctx.ui.info("use --keep-orphans to leave orphaned dependencies behind");
+        }
+        if held_side.iter().any(|name| plan.cascaded.contains(name)) {
+            ctx.ui.info("drop --cascade, or remove the dependents by name first");
+        }
+        return Err("removal includes held packages".into());
+    }
+    if !held_targets.is_empty() {
+        ctx.ui.warn(&format!(
+            "held: {} (essential, or listed in HoldPkg)",
+            held_targets.join(", ")
+        ));
+        if !ctx.dry_run {
+            if ctx.assume_yes || !ctx.ui.style.interactive {
+                return Err(
+                    "held packages are only removed with confirmation at a terminal, never with --yes"
+                        .into(),
+                );
+            }
+            if !ctx.ui.confirm("remove held packages anyway?", false) {
+                return Err("cancelled".into());
+            }
+        }
+    }
+
     if ctx.dry_run {
         ctx.ui.info("dry run — nothing was changed");
         return Ok(Outcome {
             removed: Vec::new(),
             preserved: Vec::new(),
         });
+    }
+
+    // An orphan sweep removes packages nobody named. Under `--yes` nobody
+    // reads the plan either, so the caller has to have asked for it.
+    if ctx.assume_yes && !plan.orphaned.is_empty() && !options.remove_orphans {
+        ctx.ui
+            .err("removal would also take orphaned dependencies, and --yes skips the review:");
+        ctx.ui.tree(&plan.orphaned);
+        ctx.ui.info(
+            "check with --dry-run, then pass --remove-orphans to take them or --keep-orphans to leave them",
+        );
+        return Err("orphan removal under --yes needs --remove-orphans".into());
     }
 
     if !ctx.assume_yes && !ctx.ui.confirm("proceed with removal?", false) {

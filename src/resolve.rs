@@ -56,11 +56,21 @@ pub enum Reason {
     Dependency { of: String },
     /// Needed only to build an AUR package.
     MakeDependency { of: String },
+    /// The makepkg toolchain, pulled in because an AUR package needs building.
+    Toolchain { of: String },
 }
 
 impl Reason {
     pub fn is_explicit(&self) -> bool {
         matches!(self, Reason::Explicit)
+    }
+
+    /// Whether the installed record says "explicitly installed". The
+    /// toolchain does: it outlives the build that brought it, and recorded
+    /// as a dependency that nothing requires, it read as an orphan -- sudo,
+    /// pacman and tar with it, since base-devel depends on all three.
+    pub fn records_explicit(&self) -> bool {
+        matches!(self, Reason::Explicit | Reason::Toolchain { .. })
     }
 }
 
@@ -371,7 +381,11 @@ impl<'a> Resolver<'a> {
             }
             match self.find(dep, seen) {
                 Some(child) => {
-                    let child_reason = if is_make {
+                    let child_reason = if is_make && AUR_TOOLCHAIN.contains(&dep.name.as_str()) {
+                        Reason::Toolchain {
+                            of: pkg.name.clone(),
+                        }
+                    } else if is_make {
                         Reason::MakeDependency {
                             of: pkg.name.clone(),
                         }
@@ -947,7 +961,12 @@ mod tests {
                 .iter()
                 .find(|r| r.package.name == *tool)
                 .unwrap();
-            assert!(matches!(resolved.reason, Reason::MakeDependency { .. }));
+            // Recorded as explicit once installed: a toolchain left marked as
+            // a dependency is an orphan, and base-devel brings sudo and
+            // pacman down with it.
+            assert!(matches!(resolved.reason, Reason::Toolchain { .. }));
+            assert!(resolved.reason.records_explicit());
+            assert!(!resolved.reason.is_explicit(), "still shown as pulled in, not as a target");
         }
     }
 

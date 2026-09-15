@@ -291,14 +291,23 @@ rvn refuses a removal that would break something else, and says what:
 Dependencies of the target that nothing else needs are removed along with it, so
 uninstalling does not silently leave a system full of orphans. Only the target's own
 dependency chain is considered: a package that was already unneeded before the
-removal is left alone. Packages listed in `HoldPkg` (`pacman glibc` when unset) are
-never removed, and every removal is recorded in `LogFile` (`/var/log/pacman.log`
+removal is left alone. Every removal is recorded in `LogFile` (`/var/log/pacman.log`
 by default).
+
+With `--yes` (and so through `rvnd`) nobody reviews the plan, so an uninstall that
+would also take orphans is refused unless `--remove-orphans` or `--keep-orphans` says
+which. Held packages are never removed as orphans or dependents: rvn always holds
+`filesystem glibc bash coreutils util-linux shadow pam sudo pacman tar`, plus anything
+in `HoldPkg` (`pacman glibc` when unset). Naming a held package outright asks for
+confirmation at a terminal and is refused under `--yes`. The makepkg toolchain an AUR
+build pulls in (`base-devel`, `git`) is recorded as explicitly installed, so it never
+becomes an orphan.
 
 | Option | Effect |
 | --- | --- |
 | `--cascade` | Also remove packages that depend on the targets |
 | `--keep-orphans` | Leave behind dependencies nothing needs any more |
+| `--remove-orphans` | Remove orphaned dependencies without asking (needed with `--yes`) |
 | `--nodeps` | Remove even if it breaks other packages |
 | `--dry-run` | Show what would be removed without changing anything |
 

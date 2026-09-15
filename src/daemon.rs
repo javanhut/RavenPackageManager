@@ -84,6 +84,10 @@ pub struct Request {
     pub cascade: bool,
     #[serde(default)]
     pub keep_orphans: bool,
+    /// The client showed the orphans from its dry run and the user agreed.
+    /// Every daemon run is `--yes`, so without this an orphan sweep is refused.
+    #[serde(default)]
+    pub remove_orphans: bool,
     #[serde(default)]
     pub nodeps: bool,
     // update
@@ -142,6 +146,9 @@ impl Request {
                 }
                 if self.keep_orphans {
                     argv.push("--keep-orphans".into());
+                }
+                if self.remove_orphans {
+                    argv.push("--remove-orphans".into());
                 }
                 if self.nodeps {
                     argv.push("--nodeps".into());
@@ -594,6 +601,16 @@ mod tests {
         assert_eq!(
             r.validate().unwrap(),
             vec!["--json", "--yes", "uninstall", "--cascade", "--keep-orphans", "foo"]
+        );
+        let r = Request {
+            op: Some(Op::Uninstall),
+            packages: vec!["foo".into()],
+            remove_orphans: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            r.validate().unwrap(),
+            vec!["--json", "--yes", "uninstall", "--remove-orphans", "foo"]
         );
         let r = Request { op: Some(Op::Sync), ..Default::default() };
         assert_eq!(r.validate().unwrap(), vec!["--json", "--yes", "sync"]);

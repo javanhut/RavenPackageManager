@@ -106,6 +106,13 @@ fn cli() -> Command {
                         .help("Leave behind dependencies nothing needs any more"),
                 )
                 .arg(
+                    Arg::new("remove-orphans")
+                        .long("remove-orphans")
+                        .action(ArgAction::SetTrue)
+                        .conflicts_with("keep-orphans")
+                        .help("Remove orphaned dependencies without asking (needed with --yes)"),
+                )
+                .arg(
                     Arg::new("nodeps")
                         .long("nodeps")
                         .action(ArgAction::SetTrue)
@@ -533,6 +540,7 @@ fn main() -> ExitCode {
                 packages: packages(sub),
                 cascade: sub.get_flag("cascade"),
                 keep_orphans: sub.get_flag("keep-orphans"),
+                remove_orphans: sub.get_flag("remove-orphans"),
                 nodeps: sub.get_flag("nodeps"),
                 ..Default::default()
             },
@@ -541,10 +549,12 @@ fn main() -> ExitCode {
             build_context(&matches, sub).and_then(|mut ctx| {
                 // Removing a package should not leave its dependencies behind,
                 // so orphan cleanup is the default rather than a flag to remember.
+                // Under --yes it also needs --remove-orphans; see ops::remove.
                 let options = rvn::remove::Options {
                     cascade: sub.get_flag("cascade"),
                     recursive: !sub.get_flag("keep-orphans"),
                     nodeps: sub.get_flag("nodeps"),
+                    remove_orphans: sub.get_flag("remove-orphans"),
                 };
                 ops::remove::run(&mut ctx, &packages(sub), options).map(|_| ())
             })

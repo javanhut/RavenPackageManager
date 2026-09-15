@@ -824,7 +824,7 @@ fn install_archives(
             .unwrap_or(crate::pkg::Validation::None);
         record.install_reason = match ctx.local.get(name).map(|p| p.install_reason) {
             Some(InstallReason::Explicit) => InstallReason::Explicit,
-            _ if resolved.reason.is_explicit() => InstallReason::Explicit,
+            _ if resolved.reason.records_explicit() => InstallReason::Explicit,
             _ => InstallReason::Dependency,
         };
 
