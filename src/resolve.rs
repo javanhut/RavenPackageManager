@@ -271,6 +271,11 @@ impl<'a> Resolver<'a> {
         // so one virtual dependency is never satisfied twice over.
         let mut seen: HashMap<String, Package> = HashMap::new();
         let mut stack: Vec<String> = Vec::new();
+        // What each target resolved to. A target another target depends on is
+        // visited first as that one's dependency, and `seen` then skips it --
+        // so without this pass, `rvn install base-devel sudo` recorded sudo as
+        // a dependency, and removing base-devel later swept it as an orphan.
+        let mut chosen: Vec<String> = Vec::new();
 
         for target in targets {
             let dep = Dep::parse(target);
@@ -289,6 +294,7 @@ impl<'a> Resolver<'a> {
 
             match self.find(&dep, &seen) {
                 Some(pkg) => {
+                    chosen.push(pkg.name.clone());
                     self.visit(pkg, Reason::Explicit, &mut plan, &mut seen, &mut stack);
                 }
                 None => plan.missing.push(Missing {
@@ -296,6 +302,15 @@ impl<'a> Resolver<'a> {
                     required_by: None,
                 }),
             }
+        }
+
+        // Named on the command line means explicit, however it was reached.
+        for resolved in plan
+            .install
+            .iter_mut()
+            .filter(|r| chosen.contains(&r.package.name))
+        {
+            resolved.reason = Reason::Explicit;
         }
 
         self.detect_conflicts(&mut plan);
@@ -923,6 +938,31 @@ mod tests {
         assert_eq!(plan.aur_count(), 0);
     }
 
+    // Recovering from the mako uninstall named 79 packages at once; the ones
+    // another target depended on (sudo via base-devel) came out recorded as
+    // dependencies, one uninstall away from being swept again.
+    #[test]
+    fn a_target_another_target_depends_on_is_still_explicit() {
+        let dbs = sync_db(vec![
+            pkg("base-devel", "1-2", &["sudo", "make"]),
+            pkg("sudo", "1.9-1", &[]),
+            pkg("make", "4.4-1", &[]),
+        ]);
+        let plan = Resolver::new(&dbs, &empty_local(), &NoSource)
+            .resolve(&["base-devel".into(), "sudo".into()]);
+
+        let reason = |name: &str| {
+            plan.install
+                .iter()
+                .find(|r| r.package.name == name)
+                .map(|r| r.reason.clone())
+                .unwrap()
+        };
+        assert!(reason("base-devel").is_explicit());
+        assert!(reason("sudo").is_explicit(), "named, so explicit");
+        assert!(!reason("make").is_explicit(), "only pulled in");
+    }
+
     /// Marks the makepkg toolchain as present, for tests about something else.
     fn toolchain_installed(local: &mut LocalDb) {
         for tool in AUR_TOOLCHAIN {
@@ -966,7 +1006,10 @@ mod tests {
             // pacman down with it.
             assert!(matches!(resolved.reason, Reason::Toolchain { .. }));
             assert!(resolved.reason.records_explicit());
-            assert!(!resolved.reason.is_explicit(), "still shown as pulled in, not as a target");
+            assert!(
+                !resolved.reason.is_explicit(),
+                "still shown as pulled in, not as a target"
+            );
         }
     }
 

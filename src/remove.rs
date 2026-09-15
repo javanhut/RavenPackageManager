@@ -473,7 +473,11 @@ mod tests {
         let local = db(
             "held",
             vec![
-                pkg("base-devel", &["sudo", "make", "glibc"], InstallReason::Explicit),
+                pkg(
+                    "base-devel",
+                    &["sudo", "make", "glibc"],
+                    InstallReason::Explicit,
+                ),
                 pkg("sudo", &[], InstallReason::Dependency),
                 pkg("make", &[], InstallReason::Dependency),
                 pkg("glibc", &[], InstallReason::Dependency),

@@ -100,10 +100,12 @@ pub fn execute(
             .err("removal would take held packages that were not named:");
         ctx.ui.tree(&held_side);
         if held_side.iter().any(|name| plan.orphaned.contains(name)) {
-            ctx.ui.info("use --keep-orphans to leave orphaned dependencies behind");
+            ctx.ui
+                .info("use --keep-orphans to leave orphaned dependencies behind");
         }
         if held_side.iter().any(|name| plan.cascaded.contains(name)) {
-            ctx.ui.info("drop --cascade, or remove the dependents by name first");
+            ctx.ui
+                .info("drop --cascade, or remove the dependents by name first");
         }
         return Err("removal includes held packages".into());
     }
