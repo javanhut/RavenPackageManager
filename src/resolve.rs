@@ -10,6 +10,7 @@ use crate::db::local::LocalDb;
 use crate::db::sync::SyncDb;
 use crate::pkg::{Dep, Package};
 use crate::version::vercmp;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -149,6 +150,9 @@ pub struct Resolver<'a> {
     /// request. A VCS package's version does not change when upstream moves,
     /// so nothing else would ever schedule it.
     force: HashSet<String>,
+    /// Installed packages whose own dependencies have already been checked
+    /// by [`Resolver::repair`], so each is walked once per resolution.
+    checked: RefCell<HashSet<String>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -159,6 +163,7 @@ impl<'a> Resolver<'a> {
             aur,
             ignore: HashSet::new(),
             force: HashSet::new(),
+            checked: RefCell::new(HashSet::new()),
         }
     }
 
@@ -287,6 +292,10 @@ impl<'a> Resolver<'a> {
                     && self.upgrade_candidate(&dep.name).is_none()
                     && !self.force.contains(&dep.name)
                 {
+                    // Asking again for something installed is how anyone
+                    // would try to fix it, so whatever it is missing
+                    // underneath is still installed.
+                    self.repair(installed, &mut plan, &mut seen, &mut stack);
                     plan.already_satisfied.push(dep.name.clone());
                     continue;
                 }
@@ -375,8 +384,10 @@ impl<'a> Resolver<'a> {
             .map(|d| (d, false))
             .chain(build_deps.iter().map(|d| (d, true)))
         {
-            // Anything the system already provides needs no work.
-            if self.local.satisfier(dep).is_some() {
+            // Anything the system already provides needs no work -- as long
+            // as what provides it is itself whole.
+            if let Some(installed) = self.local.satisfier(dep) {
+                self.repair(installed, plan, seen, stack);
                 continue;
             }
             // Something already in the plan may satisfy this through a
@@ -426,6 +437,52 @@ impl<'a> Resolver<'a> {
             reason,
             replaces_version,
         });
+    }
+
+    /// Pulls into the plan whatever an installed package depends on that the
+    /// system does not have.
+    ///
+    /// The local database is trusted to say what is installed, not that what
+    /// is installed is complete. A package recorded without its dependencies
+    /// -- removed with --nodeps, left by an interrupted transaction, or put
+    /// there by anything other than rvn -- satisfied every lookup, so nothing
+    /// ever walked below it: `rvn install brave-bin` found glib2 and
+    /// gdk-pixbuf2 installed and never noticed pcre2 and glycin were not, and
+    /// the user had to install those by hand and start again.
+    ///
+    /// A missing dependency nothing provides is left alone rather than
+    /// reported: the system was already running without it, and refusing an
+    /// unrelated install over it would be worse than the gap.
+    fn repair(
+        &self,
+        installed: &Package,
+        plan: &mut Plan,
+        seen: &mut HashMap<String, Package>,
+        stack: &mut Vec<String>,
+    ) {
+        // A package being replaced in this plan gets the new version's
+        // dependencies from `visit`; the old ones no longer matter.
+        if seen.contains_key(&installed.name)
+            || !self.checked.borrow_mut().insert(installed.name.clone())
+        {
+            return;
+        }
+
+        for dep in &installed.depends {
+            if let Some(next) = self.local.satisfier(dep) {
+                self.repair(next, plan, seen, stack);
+                continue;
+            }
+            if seen.values().any(|p| p.satisfies(dep)) {
+                continue;
+            }
+            if let Some(child) = self.find(dep, seen) {
+                let reason = Reason::Dependency {
+                    of: installed.name.clone(),
+                };
+                self.visit(child, reason, plan, seen, stack);
+            }
+        }
     }
 
     /// Flags packages in the plan that conflict with each other or with
@@ -596,6 +653,84 @@ mod tests {
             .insert("libfoo".into(), pkg("libfoo", "2.0-1", &[]));
 
         let plan = Resolver::new(&dbs, &local, &NoSource).resolve(&["app".into()]);
+        assert_eq!(names(&plan), vec!["app"]);
+    }
+
+    /// The brave-bin case: gtk3's dependencies were recorded as installed,
+    /// theirs were not.
+    fn installed_without_their_dependencies() -> (Vec<SyncDb>, LocalDb) {
+        let dbs = sync_db(vec![
+            pkg("brave-bin", "1.95-1", &["gtk3"]),
+            pkg("gtk3", "3.24-1", &["glib2", "gdk-pixbuf2"]),
+            pkg("glib2", "2.88-1", &["pcre2"]),
+            pkg("gdk-pixbuf2", "2.44-1", &["glib2", "glycin"]),
+            pkg("pcre2", "10.48-1", &[]),
+            pkg("glycin", "2.1-1", &["glib2"]),
+        ]);
+        let mut local = empty_local();
+        local
+            .packages
+            .insert("glib2".into(), pkg("glib2", "2.88-1", &["pcre2"]));
+        local.packages.insert(
+            "gdk-pixbuf2".into(),
+            pkg("gdk-pixbuf2", "2.44-1", &["glib2", "glycin"]),
+        );
+        (dbs, local)
+    }
+
+    #[test]
+    fn missing_dependencies_of_installed_packages_are_pulled_in() {
+        let (dbs, local) = installed_without_their_dependencies();
+        let plan = Resolver::new(&dbs, &local, &NoSource).resolve(&["brave-bin".into()]);
+
+        assert!(plan.missing.is_empty(), "missing: {:?}", plan.missing);
+        let order = names(&plan);
+        for name in ["pcre2", "glycin", "gtk3", "brave-bin"] {
+            assert!(order.contains(&name.to_string()), "{name} not in {order:?}");
+        }
+        // Installed packages are not reinstalled to get there.
+        assert!(!order.contains(&"glib2".to_string()));
+        assert!(!order.contains(&"gdk-pixbuf2".to_string()));
+        let glycin = plan
+            .install
+            .iter()
+            .find(|r| r.package.name == "glycin")
+            .unwrap();
+        assert_eq!(
+            glycin.reason,
+            Reason::Dependency {
+                of: "gdk-pixbuf2".into()
+            }
+        );
+        assert!(!glycin.reason.records_explicit());
+    }
+
+    #[test]
+    fn reinstalling_an_installed_target_repairs_what_it_is_missing() {
+        let (dbs, mut local) = installed_without_their_dependencies();
+        local.packages.insert(
+            "gtk3".into(),
+            pkg("gtk3", "3.24-1", &["glib2", "gdk-pixbuf2"]),
+        );
+
+        let plan = Resolver::new(&dbs, &local, &NoSource).resolve(&["gtk3".into()]);
+        assert_eq!(plan.already_satisfied, vec!["gtk3"]);
+        let mut order = names(&plan);
+        order.sort();
+        assert_eq!(order, vec!["glycin", "pcre2"]);
+    }
+
+    #[test]
+    fn an_unavailable_dependency_of_an_installed_package_does_not_block() {
+        let dbs = sync_db(vec![pkg("app", "1.0-1", &["libfoo"])]);
+        let mut local = empty_local();
+        local.packages.insert(
+            "libfoo".into(),
+            pkg("libfoo", "1.0-1", &["gone-from-repos"]),
+        );
+
+        let plan = Resolver::new(&dbs, &local, &NoSource).resolve(&["app".into()]);
+        assert!(plan.missing.is_empty(), "missing: {:?}", plan.missing);
         assert_eq!(names(&plan), vec!["app"]);
     }
 
