@@ -47,7 +47,10 @@ pub fn refresh(root: &Path, stale: Stale, warn: &mut impl FnMut(&str)) {
     if stale.desktop {
         run(
             "update-desktop-database",
-            &[OsStr::new("-q"), root.join("usr/share/applications").as_os_str()],
+            &[
+                OsStr::new("-q"),
+                root.join("usr/share/applications").as_os_str(),
+            ],
             "desktop-file-utils",
             warn,
         );
@@ -69,9 +72,9 @@ fn run(tool: &str, args: &[&OsStr], package: &str, warn: &mut impl FnMut(&str)) 
             "{tool} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            warn(&format!("{tool} is missing (from {package}); desktop caches not refreshed"))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => warn(&format!(
+            "{tool} is missing (from {package}); desktop caches not refreshed"
+        )),
         Err(e) => warn(&format!("could not run {tool}: {e}")),
     }
 }
@@ -87,15 +90,30 @@ mod tests {
     #[test]
     fn a_desktop_entry_marks_the_desktop_database() {
         let mut stale = Stale::default();
-        stale.note(&files(&["usr/bin/brave", "usr/share/applications/brave-browser.desktop"]));
-        assert_eq!(stale, Stale { desktop: true, mime: false });
+        stale.note(&files(&[
+            "usr/bin/brave",
+            "usr/share/applications/brave-browser.desktop",
+        ]));
+        assert_eq!(
+            stale,
+            Stale {
+                desktop: true,
+                mime: false
+            }
+        );
     }
 
     #[test]
     fn a_mime_package_marks_the_mime_database() {
         let mut stale = Stale::default();
         stale.note(&files(&["usr/share/mime/packages/foo.xml"]));
-        assert_eq!(stale, Stale { desktop: false, mime: true });
+        assert_eq!(
+            stale,
+            Stale {
+                desktop: false,
+                mime: true
+            }
+        );
     }
 
     #[test]
@@ -115,13 +133,21 @@ mod tests {
         let mut stale = Stale::default();
         stale.note(&files(&["usr/share/applications/a.desktop"]));
         stale.note(&files(&["usr/share/mime/packages/b.xml"]));
-        assert_eq!(stale, Stale { desktop: true, mime: true });
+        assert_eq!(
+            stale,
+            Stale {
+                desktop: true,
+                mime: true
+            }
+        );
     }
 
     #[test]
     fn nothing_stale_runs_nothing_and_warns_nothing() {
         let mut warned = Vec::new();
-        refresh(Path::new("/nonexistent"), Stale::default(), &mut |w| warned.push(w.to_string()));
+        refresh(Path::new("/nonexistent"), Stale::default(), &mut |w| {
+            warned.push(w.to_string())
+        });
         assert!(warned.is_empty());
     }
 }

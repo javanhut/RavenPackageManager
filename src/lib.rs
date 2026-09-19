@@ -9,6 +9,7 @@ pub mod fetch;
 pub mod hooks;
 pub mod ops;
 pub mod pkg;
+pub mod provides;
 pub mod remove;
 pub mod resolve;
 pub mod ui;

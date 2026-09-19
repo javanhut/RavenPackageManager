@@ -104,11 +104,13 @@ pub fn execute(ctx: &mut Context, targets: &[String]) -> Result<Outcome, String>
 
         let plan = if ctx.repo_only {
             Resolver::new(&ctx.sync, &ctx.local, &NoSource)
+                .with_system(&ctx.system)
                 .ignoring(&ctx.config.ignore_pkg)
                 .forcing(&ctx.force_rebuild)
                 .resolve(targets)
         } else {
             Resolver::new(&ctx.sync, &ctx.local, &ctx.aur)
+                .with_system(&ctx.system)
                 .ignoring(&ctx.config.ignore_pkg)
                 .forcing(&ctx.force_rebuild)
                 .resolve(targets)
@@ -128,6 +130,12 @@ pub fn execute(ctx: &mut Context, targets: &[String]) -> Result<Outcome, String>
     };
 
     report_problems(ctx, &plan)?;
+
+    for (name, by) in &plan.provided_by_system {
+        ctx.ui.info(&format!(
+            "{name} is provided by Raven itself ({by}); installing it would replace that, so it is skipped"
+        ));
+    }
 
     if plan.is_empty() {
         for name in &plan.already_satisfied {

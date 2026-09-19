@@ -7,6 +7,7 @@
 
 use crate::db::local::LocalDb;
 use crate::pkg::{InstallReason, Package};
+use crate::provides::SystemProvides;
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -81,7 +82,11 @@ impl RemovalPlan {
 
 /// Every installed package outside `removing` that would lose a dependency,
 /// paired with the dependency in question.
-fn broken_by(local: &LocalDb, removing: &HashSet<String>) -> Vec<(String, String)> {
+fn broken_by(
+    local: &LocalDb,
+    system: &SystemProvides,
+    removing: &HashSet<String>,
+) -> Vec<(String, String)> {
     let mut broken = Vec::new();
 
     for pkg in local.packages.values() {
@@ -96,10 +101,14 @@ fn broken_by(local: &LocalDb, removing: &HashSet<String>) -> Vec<(String, String
             }
             // Something outside the removal set still satisfying it means no
             // breakage, even if one provider is going away.
-            let survives = local
-                .packages
-                .values()
-                .any(|other| !removing.contains(&other.name) && other.satisfies(dep));
+            // The base system providing it counts too: removing an
+            // `xdg-utils` rvn once installed breaks nothing while raven-open
+            // stands in for it.
+            let survives = system.satisfier(dep).is_some()
+                || local
+                    .packages
+                    .values()
+                    .any(|other| !removing.contains(&other.name) && other.satisfies(dep));
             if !survives {
                 broken.push((pkg.name.clone(), dep.to_string()));
             }
@@ -156,6 +165,17 @@ fn removal_order(local: &LocalDb, names: &HashSet<String>) -> Vec<Package> {
 
 /// Builds a removal plan for `targets`.
 pub fn plan(local: &LocalDb, targets: &[String], options: Options) -> RemovalPlan {
+    plan_with(local, &SystemProvides::default(), targets, options)
+}
+
+/// [`plan`], counting what the base system provides as still satisfying
+/// dependencies after the removal.
+pub fn plan_with(
+    local: &LocalDb,
+    system: &SystemProvides,
+    targets: &[String],
+    options: Options,
+) -> RemovalPlan {
     let mut plan = RemovalPlan::default();
     let mut removing: HashSet<String> = HashSet::new();
 
@@ -174,7 +194,7 @@ pub fn plan(local: &LocalDb, targets: &[String], options: Options) -> RemovalPla
     // Cascade first: pulling in dependents can itself orphan more packages.
     if options.cascade {
         loop {
-            let broken = broken_by(local, &removing);
+            let broken = broken_by(local, system, &removing);
             let additions: Vec<String> = broken
                 .iter()
                 .map(|(name, _)| name.clone())
@@ -222,7 +242,7 @@ pub fn plan(local: &LocalDb, targets: &[String], options: Options) -> RemovalPla
     }
 
     if !options.nodeps {
-        let broken = broken_by(local, &removing);
+        let broken = broken_by(local, system, &removing);
         if !broken.is_empty() {
             // Report against the target that is actually disappearing.
             let mut blocked: Vec<Blocked> = Vec::new();
@@ -350,6 +370,27 @@ mod tests {
         assert_eq!(plan.blocked.len(), 1);
         assert_eq!(plan.blocked[0].package, "libfoo");
         assert_eq!(plan.blocked[0].required_by[0].0, "app");
+    }
+
+    #[test]
+    fn removing_what_the_system_also_provides_breaks_nothing() {
+        // An xdg-utils rvn installed before raven-open existed: chromium
+        // still needs *an* xdg-utils, and the system has one.
+        let local = db(
+            "system-provided",
+            vec![
+                pkg("chromium", &["xdg-utils"], InstallReason::Explicit),
+                pkg("xdg-utils", &[], InstallReason::Dependency),
+            ],
+        );
+        let system = SystemProvides::from(crate::provides::parse("xdg-utils=1.2.1", "raven-open"));
+        let with = plan_with(&local, &system, &["xdg-utils".into()], Options::default());
+        assert_eq!(names(&with), vec!["xdg-utils"]);
+        assert!(with.blocked.is_empty());
+
+        // Without the provision the same removal is still refused.
+        let without = plan(&local, &["xdg-utils".into()], Options::default());
+        assert_eq!(without.blocked.len(), 1);
     }
 
     #[test]

@@ -20,6 +20,9 @@ use std::sync::OnceLock;
 pub struct Context {
     pub config: Config,
     pub local: LocalDb,
+    /// What the base system provides without a package; see
+    /// [`crate::provides`].
+    pub system: crate::provides::SystemProvides,
     pub sync: Vec<SyncDb>,
     pub aur: Aur,
     pub ui: Ui,
@@ -75,11 +78,13 @@ impl Context {
     pub fn from_config(config: Config, ui: Ui) -> Context {
         let db_path_for_devel = config.db_path.clone();
         let local = LocalDb::load(&config.local_db_path());
+        let system = crate::provides::SystemProvides::load(&config.root_dir);
         let (sync, _missing) = crate::db::sync::load_all(&config);
 
         Context {
             config,
             local,
+            system,
             sync,
             aur: Aur::new(),
             ui,

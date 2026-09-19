@@ -26,7 +26,7 @@ pub fn execute(
 ) -> Result<Outcome, String> {
     let plan = {
         let spinner = ctx.ui.stage(&format!("checking {}", targets.join(", ")));
-        let plan = remove::plan(&ctx.local, targets, options);
+        let plan = remove::plan_with(&ctx.local, &ctx.system, targets, options);
         if plan.blocked.is_empty() {
             spinner.succeed(&format!(
                 "{} package{} to remove",

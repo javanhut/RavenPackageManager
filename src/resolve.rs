@@ -9,6 +9,7 @@
 use crate::db::local::LocalDb;
 use crate::db::sync::SyncDb;
 use crate::pkg::{Dep, Package};
+use crate::provides::SystemProvides;
 use crate::version::vercmp;
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -110,6 +111,10 @@ pub struct Plan {
     /// (successor, replaced). These are retired rather than treated as
     /// conflicts, which is how a package rename is meant to work.
     pub replacing: Vec<(String, String)>,
+    /// Targets the base system itself provides, as (target, provided by).
+    /// Installing them would put a package over the component standing in
+    /// for it, so they are refused rather than resolved.
+    pub provided_by_system: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +158,9 @@ pub struct Resolver<'a> {
     /// Installed packages whose own dependencies have already been checked
     /// by [`Resolver::repair`], so each is walked once per resolution.
     checked: RefCell<HashSet<String>>,
+    /// What the base system provides without a package, per
+    /// [`crate::provides`].
+    system: Option<&'a SystemProvides>,
 }
 
 impl<'a> Resolver<'a> {
@@ -164,7 +172,20 @@ impl<'a> Resolver<'a> {
             ignore: HashSet::new(),
             force: HashSet::new(),
             checked: RefCell::new(HashSet::new()),
+            system: None,
         }
+    }
+
+    /// Treats what the base system provides as satisfied, and refuses to
+    /// install over it.
+    pub fn with_system(mut self, system: &'a SystemProvides) -> Self {
+        self.system = Some(system);
+        self
+    }
+
+    /// Whether the base system provides `dep` without any package.
+    fn system_provides(&self, dep: &Dep) -> bool {
+        self.system.is_some_and(|s| s.satisfier(dep).is_some())
     }
 
     pub fn ignoring(mut self, names: &[String]) -> Self {
@@ -285,6 +306,14 @@ impl<'a> Resolver<'a> {
         for target in targets {
             let dep = Dep::parse(target);
 
+            // Named explicitly or not, a package is never put over the
+            // component the system built in its place.
+            if let Some(provision) = self.system.and_then(|s| s.named(&dep.name)) {
+                plan.provided_by_system
+                    .push((dep.name.clone(), provision.by.clone()));
+                continue;
+            }
+
             // An explicit target that is already installed and satisfying is
             // reported, not reinstalled.
             if let Some(installed) = self.local.get(&dep.name) {
@@ -390,6 +419,9 @@ impl<'a> Resolver<'a> {
                 self.repair(installed, plan, seen, stack);
                 continue;
             }
+            if self.system_provides(dep) {
+                continue;
+            }
             // Something already in the plan may satisfy this through a
             // provide; revisiting it records a cycle if there is one and
             // otherwise returns straight away.
@@ -473,7 +505,7 @@ impl<'a> Resolver<'a> {
                 self.repair(next, plan, seen, stack);
                 continue;
             }
-            if seen.values().any(|p| p.satisfies(dep)) {
+            if self.system_provides(dep) || seen.values().any(|p| p.satisfies(dep)) {
                 continue;
             }
             if let Some(child) = self.find(dep, seen) {
@@ -653,6 +685,76 @@ mod tests {
             .insert("libfoo".into(), pkg("libfoo", "2.0-1", &[]));
 
         let plan = Resolver::new(&dbs, &local, &NoSource).resolve(&["app".into()]);
+        assert_eq!(names(&plan), vec!["app"]);
+    }
+
+    fn raven_open() -> SystemProvides {
+        SystemProvides::from(crate::provides::parse("xdg-utils=1.2.1\n", "raven-open"))
+    }
+
+    #[test]
+    fn a_dependency_the_system_provides_is_not_installed() {
+        // chromium depends on xdg-utils; raven-open already is it.
+        let dbs = sync_db(vec![
+            pkg("chromium", "130-1", &["xdg-utils", "nss"]),
+            pkg("xdg-utils", "1.2.1-2", &[]),
+            pkg("nss", "3.1-1", &[]),
+        ]);
+        let local = empty_local();
+        let system = raven_open();
+        let plan = Resolver::new(&dbs, &local, &NoSource)
+            .with_system(&system)
+            .resolve(&["chromium".into()]);
+        assert!(plan.missing.is_empty(), "missing: {:?}", plan.missing);
+        assert_eq!(names(&plan), vec!["nss", "chromium"]);
+    }
+
+    #[test]
+    fn a_version_the_system_cannot_meet_is_still_resolved_from_the_repos() {
+        let dbs = sync_db(vec![
+            pkg("app", "1-1", &["xdg-utils>=2"]),
+            pkg("xdg-utils", "2.0-1", &[]),
+        ]);
+        let local = empty_local();
+        let system = raven_open();
+        let plan = Resolver::new(&dbs, &local, &NoSource)
+            .with_system(&system)
+            .resolve(&["app".into()]);
+        assert_eq!(names(&plan), vec!["xdg-utils", "app"]);
+    }
+
+    #[test]
+    fn asking_for_what_the_system_provides_is_refused_by_name() {
+        let dbs = sync_db(vec![pkg("xdg-utils", "1.2.1-2", &[])]);
+        let local = empty_local();
+        let system = raven_open();
+        let plan = Resolver::new(&dbs, &local, &NoSource)
+            .with_system(&system)
+            .resolve(&["xdg-utils".into()]);
+        assert!(plan.is_empty());
+        assert_eq!(
+            plan.provided_by_system,
+            vec![("xdg-utils".to_string(), "raven-open".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_installed_package_leaning_on_the_system_is_not_repaired() {
+        // An installed chromium whose xdg-utils dependency is met by the
+        // system must not have xdg-utils "repaired" in underneath it.
+        let dbs = sync_db(vec![
+            pkg("app", "1-1", &["chromium"]),
+            pkg("chromium", "130-1", &["xdg-utils"]),
+            pkg("xdg-utils", "1.2.1-2", &[]),
+        ]);
+        let mut local = empty_local();
+        local
+            .packages
+            .insert("chromium".into(), pkg("chromium", "130-1", &["xdg-utils"]));
+        let system = raven_open();
+        let plan = Resolver::new(&dbs, &local, &NoSource)
+            .with_system(&system)
+            .resolve(&["app".into()]);
         assert_eq!(names(&plan), vec!["app"]);
     }
 
