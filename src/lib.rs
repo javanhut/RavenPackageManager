@@ -1,4 +1,5 @@
 pub mod aur;
+pub mod caches;
 pub mod config;
 pub mod daemon;
 pub mod db;

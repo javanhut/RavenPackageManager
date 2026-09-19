@@ -713,6 +713,7 @@ fn install_archives(
     let mut progress = ctx.ui.counter("installing", total_files, "files");
     let mut installed_names = Vec::new();
     let mut removed_stale = 0usize;
+    let mut stale_caches = crate::caches::Stale::default();
 
     for (name, path, manifest) in &manifests {
         progress.set_detail(name);
@@ -857,6 +858,7 @@ fn install_archives(
         // sysusers needs root and tmpfiles describe system daemons; a
         // per-user prefix has neither, so its packages get no hooks.
         let hook_files: &[String] = if ctx.user_prefix.is_some() { &[] } else { &files };
+        stale_caches.note(hook_files);
         let applied = crate::hooks::apply(&ctx.config.root_dir, hook_files, &mut |w| {
             warnings.push(w.to_string())
         });
@@ -884,6 +886,9 @@ fn install_archives(
         installed_names.len(),
         if installed_names.len() == 1 { "" } else { "s" }
     ));
+
+    // After every package, not after each: one rebuild covers them all.
+    crate::caches::refresh(&ctx.config.root_dir, stale_caches, &mut |w| ctx.ui.warn(w));
 
     activate_service_templates(ctx);
 

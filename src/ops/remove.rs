@@ -168,6 +168,7 @@ pub fn apply(ctx: &mut Context, plan: &RemovalPlan) -> Result<Outcome, String> {
     let mut preserved = Vec::new();
     let mut log_failed = false;
     let mut touched_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut stale_caches = crate::caches::Stale::default();
 
     for pkg in &plan.remove {
         progress.set_detail(&pkg.name);
@@ -186,6 +187,10 @@ pub fn apply(ctx: &mut Context, plan: &RemovalPlan) -> Result<Outcome, String> {
 
         let files = remove::deletable_files(&ctx.local, pkg, &removing)
             .map_err(|e| format!("{}: could not determine which files to delete: {e}", pkg.name))?;
+        // A per-user prefix is not what the system caches index.
+        if ctx.user_prefix.is_none() {
+            stale_caches.note(&files);
+        }
 
         for file in &files {
             // Directory entries are pruned after every file is gone.
@@ -272,6 +277,9 @@ pub fn apply(ctx: &mut Context, plan: &RemovalPlan) -> Result<Outcome, String> {
         "pruned {pruned} empty director{}",
         if pruned == 1 { "y" } else { "ies" }
     ));
+
+    // A removed browser must stop being the handler for its links.
+    crate::caches::refresh(&ctx.config.root_dir, stale_caches, &mut |w| ctx.ui.warn(w));
 
     // ---- summary -------------------------------------------------------
     ctx.ui.blank();
