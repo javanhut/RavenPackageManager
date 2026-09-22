@@ -634,6 +634,36 @@ impl Decision {
     }
 }
 
+/// What a request needing authorization gets when no prompt could be raised.
+///
+/// One place, because there are two ways to arrive at it -- a prompt that
+/// could not be sent, and a caller with no session on a machine where
+/// nothing was listening to prompt anyway -- and a machine that allows one
+/// while refusing the other is answering the same question twice.
+fn unavailable(config: &ServerConfig, why: &str) -> Decision {
+    use crate::policy::Unavailable;
+    match config.policy.on_auth_unavailable {
+        Unavailable::Allow => Decision {
+            allowed: true,
+            how: "unavailable",
+            reason: format!("nothing could be asked: {why}"),
+            warning: Some(format!(
+                "rvnd could not ask anyone to authorize this and let it through anyway: {why}. \
+                 Set on_auth_unavailable = \"deny\" in {} once prompts work on this machine.",
+                config.policy.source.display()
+            )),
+        },
+        Unavailable::Deny => Decision::refuse(
+            "unavailable",
+            format!(
+                "this needs someone to authorize it and nothing could be asked ({why}); \
+                 {} says to refuse when that happens",
+                config.policy.source.display()
+            ),
+        ),
+    }
+}
+
 /// Whether this peer may have this request, and how that was settled.
 ///
 /// Every input is something rvnd established for itself -- the credentials
@@ -648,7 +678,7 @@ fn decide(
     class: crate::policy::Class,
     session: Option<crate::auth::Session>,
 ) -> Decision {
-    use crate::policy::{Rule, Unavailable};
+    use crate::policy::Rule;
 
     // Root is already root. It has no need of this daemon at all, and a
     // prompt asking the superuser to confirm that it is the superuser would
@@ -687,7 +717,21 @@ fn decide(
             // deliberately not the `on_auth_unavailable` case: that setting
             // is about a missing *mechanism*, and treating a missing asker as
             // a missing mechanism would make "exit quickly" the way past it.
+            //
+            // Unless there is no mechanism either, which is checked first.
+            // Refusing here while the identical request from a caller whose
+            // session did resolve is waved through by `on_auth_unavailable`
+            // is not one policy, it is two answers to one question, settled
+            // by whether /proc still had a session leader to read -- and the
+            // one it refuses is the desktop, where every process descends
+            // from a service and the message reads as a bug in the store.
+            // The probe asks about the socket and never about the caller, so
+            // exiting quickly is no way past this: a caller that stays alive
+            // gets the same answer.
             let Some(session) = session else {
+                if let Err(why) = crate::auth::reachable(&config.policy.auth_socket) {
+                    return unavailable(config, &why);
+                }
                 return Decision::refuse(
                     "session",
                     "the process that asked is no longer there to be asked back",
@@ -713,26 +757,7 @@ fn decide(
                 crate::auth::Verdict::Denied(why) => {
                     Decision::refuse("denied", format!("not authorized: {why}"))
                 }
-                crate::auth::Verdict::Unavailable(why) => match config.policy.on_auth_unavailable {
-                    Unavailable::Allow => Decision {
-                        allowed: true,
-                        how: "unavailable",
-                        reason: format!("nothing could be asked: {why}"),
-                        warning: Some(format!(
-                            "rvnd could not ask anyone to authorize this and let it through anyway: {why}. \
-                             Set on_auth_unavailable = \"deny\" in {} once prompts work on this machine.",
-                            config.policy.source.display()
-                        )),
-                    },
-                    Unavailable::Deny => Decision::refuse(
-                        "unavailable",
-                        format!(
-                            "this needs someone to authorize it and nothing could be asked ({why}); \
-                             {} says to refuse when that happens",
-                            config.policy.source.display()
-                        ),
-                    ),
-                },
+                crate::auth::Verdict::Unavailable(why) => unavailable(config, &why),
             }
         }
     }
@@ -2272,6 +2297,100 @@ mod tests {
         });
         outcome.expect("a dry run is a query");
         assert!(lines.iter().any(|l| l.contains("args:")), "{lines:?}");
+    }
+
+    /// A caller whose session cannot be resolved, on a machine where nothing
+    /// is listening for prompts.
+    ///
+    /// This is every graphical session on a machine whose init leaves its
+    /// services in session 0: the store's `rvn` is in a session whose leader
+    /// is pid 0 and `/proc` has nothing to read for it. Refusing it while the
+    /// same request from a terminal -- which has a session leader, finds no
+    /// ravend, and is allowed by `on_auth_unavailable` -- goes through is the
+    /// split this checks against.
+    #[test]
+    fn no_session_and_no_ravend_is_a_missing_mechanism_not_a_missing_asker() {
+        let policy = crate::policy::Policy {
+            auth_socket: std::env::temp_dir().join("rvnd-no-such-ravend.sock"),
+            ..crate::policy::Policy::default()
+        };
+        std::fs::remove_file(&policy.auth_socket).ok();
+        let config = ServerConfig {
+            socket: PathBuf::from("/nonexistent/ctl"),
+            group: None,
+            rvn: PathBuf::from("/nonexistent/rvn"),
+            policy,
+        };
+        let request = Request {
+            op: Some(Op::Install),
+            packages: vec!["brave-bin".into()],
+            ..Default::default()
+        };
+        let cred = Ucred {
+            pid: std::process::id() as i32,
+            uid: 1000,
+            gid: 1000,
+        };
+
+        let decision = decide(
+            &config,
+            &cred,
+            Some("someone"),
+            &request,
+            crate::policy::Class::Aur,
+            None,
+        );
+        assert!(decision.allowed, "{}", decision.reason);
+        assert_eq!(decision.how, "unavailable");
+        assert!(decision.warning.is_some(), "an allow nobody authorized says so");
+    }
+
+    /// The same caller, on a machine where a ravend *is* listening.
+    ///
+    /// Here the mechanism exists and the only thing missing is somebody to
+    /// prompt, so the refusal stands: a process that exits the moment it has
+    /// asked must not be a way past a prompt that could have been raised.
+    #[test]
+    fn no_session_with_a_ravend_listening_is_still_refused() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("rvnd-nosession-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prompt = dir.join("authorize.sock");
+        std::fs::remove_file(&prompt).ok();
+        let _listener = UnixListener::bind(&prompt).unwrap();
+
+        let config = ServerConfig {
+            socket: PathBuf::from("/nonexistent/ctl"),
+            group: None,
+            rvn: PathBuf::from("/nonexistent/rvn"),
+            policy: crate::policy::Policy {
+                auth_socket: prompt,
+                ..crate::policy::Policy::default()
+            },
+        };
+        let request = Request {
+            op: Some(Op::Install),
+            packages: vec!["brave-bin".into()],
+            ..Default::default()
+        };
+        let cred = Ucred {
+            pid: std::process::id() as i32,
+            uid: 1000,
+            gid: 1000,
+        };
+
+        let decision = decide(
+            &config,
+            &cred,
+            Some("someone"),
+            &request,
+            crate::policy::Class::Aur,
+            None,
+        );
+        assert!(!decision.allowed, "{}", decision.reason);
+        assert_eq!(decision.how, "session");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The prompt itself, against a stand-in ravend: one request is asked,

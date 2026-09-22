@@ -237,6 +237,28 @@ pub fn ask(
     }
 }
 
+/// Whether a prompt could be raised at all, for anybody.
+///
+/// `ask` needs a session to name, so a caller whose session cannot be
+/// resolved has nobody to put a prompt in front of. Before that is treated as
+/// the caller's fault, this answers the other question: could *any* session
+/// on this machine have been prompted? Nothing listening means the mechanism
+/// is missing for all of them, which is what `on_auth_unavailable` is for.
+///
+/// This cannot be reached by exiting quickly. The probe asks about the
+/// socket and never about the caller, so its answer is the same whether the
+/// process that connected is still alive or not.
+///
+/// Connecting and hanging up is the only honest test. A socket file left
+/// behind by a daemon that died is the ordinary shape of this failure, and
+/// `exists()` cannot tell one from a daemon that is listening.
+pub fn reachable(socket: &Path) -> Result<(), String> {
+    match UnixStream::connect(socket) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("{}: {e}", socket.display())),
+    }
+}
+
 /// One length-prefixed message out, one back.
 fn exchange(mut stream: UnixStream, request: &str) -> std::io::Result<String> {
     let bytes = request.as_bytes();
