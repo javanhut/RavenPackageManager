@@ -1,0 +1,57 @@
+# /etc/rvn/build.toml -- rvn, when it is building packages rather than
+# installing them.
+#
+# Every value here is a default. The whole file is optional and so is every
+# field in it, so a machine that installs packages needs none of this -- it is
+# read by `rvn build` and `rvn repo-add` and by nothing else, and those are
+# commands you run on a machine that makes packages.
+#
+# A file that is present but does not parse is a hard error: rvn refuses to
+# build rather than silently falling back to defaults, because the default is
+# "do not sign" and falling back to it would quietly ship unsigned packages to
+# everybody who installs from the repository. That is exactly the kind of
+# failure a configuration file must never have.
+#
+# There is nothing in here that is secret. The key is named, not stored: rvn
+# never reads private key material and never writes it anywhere.
+
+[sign]
+# The key `rvn build --sign` and `rvn repo-add --sign` sign with. Unset means
+# packages are not signed, which is fine for a repository served over a
+# network you control to machines that configure it `SigLevel = Optional`, and
+# is not fine for anything else -- an unsigned package is one that whoever
+# serves it can replace, and rvn installs the whole of RavenLinux's userland
+# from this repository, rvn included.
+#
+# Two forms are read.
+#
+# A key identifier gpg already knows -- a fingerprint, a long key id, or an
+# email address -- signs through gpg-agent on this machine, with whatever
+# pinentry it is set up with. This is the right form for a maintainer's own
+# workstation: the key stays where it is, and unlocking it stays gpg's
+# problem rather than becoming rvn's.
+#
+#   key = "8A1B2C3D4E5F60718293A4B5C6D7E8F901234567"
+#
+# A path to an exported secret key file is the CI form, for a runner that was
+# handed a key file and has no keyring around it. rvn imports it into a
+# throwaway GNUPGHOME of its own, made 0700 beside the package being signed,
+# uses it for that one signature and removes it -- so signing never touches
+# the keyring the person running the command uses for anything else.
+#
+#   key = "/etc/rvn/keys/raven-packages.asc"
+#
+# A passphrase-protected key file is refused rather than prompted for. rvn
+# would have to hold the passphrase to pass it to gpg, and holding it is the
+# thing this arrangement exists to avoid; use the key-identifier form and let
+# the agent do it.
+#
+# Whichever form is set, `rvn build` signs without being asked again: writing
+# a key down here is saying that packages from this machine are signed. Pass
+# --no-sign to skip it for one run, or --key to use a different one.
+#
+# The other half of this is the machine that installs the packages, which
+# needs the matching PUBLIC key in its pacman keyring -- rvn verifies against
+# /etc/pacman.d/gnupg/pubring.gpg like pacman does. A signature nobody can
+# check is not better than no signature; it is the same, with more steps.
+# key =

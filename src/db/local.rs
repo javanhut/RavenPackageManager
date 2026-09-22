@@ -140,6 +140,50 @@ impl LocalDb {
         Ok(())
     }
 
+    /// Rewrites the checksum recorded against one of a package's backup files.
+    ///
+    /// `%BACKUP%` records what the *package* shipped, not what is on disk --
+    /// that is what lets a removal tell an administrator's edits from
+    /// untouched package content. `rvn config` settles a `.pacnew` by
+    /// destroying the only remaining copy of those shipped bytes, so the
+    /// checksum has to be correct before it does, and for a `.pacnew` written
+    /// by pacman or by an older rvn it may never have been recorded at all.
+    ///
+    /// Only the `%BACKUP%` block is touched. Re-registering the package would
+    /// be the obvious way to write one field, but `register` rebuilds the
+    /// whole record and stamps `%INSTALLDATE%` with the current time -- so
+    /// reviewing a config file would silently rewrite the day the package was
+    /// installed, which `rvn info` reports and nothing else would explain.
+    ///
+    /// A package with no `%BACKUP%` block, or none listing this path, is left
+    /// alone: there is no record to correct, and inventing one would claim
+    /// the package owns a file it never declared.
+    pub fn set_backup_hash(&mut self, package: &str, path: &str, hash: &str) -> io::Result<()> {
+        let Some(pkg) = self.packages.get_mut(package) else {
+            return Ok(());
+        };
+        let Some(entry) = pkg.backup.iter_mut().find(|b| b.path == path) else {
+            return Ok(());
+        };
+        entry.hash = Some(hash.to_string());
+
+        let entries: Vec<String> = pkg.backup.iter().map(|b| b.to_entry()).collect();
+        let dir = self.root.join(format!("{}-{}", pkg.name, pkg.version));
+        let desc_path = dir.join("desc");
+        let text = std::fs::read_to_string(&desc_path)?;
+        let Some(updated) = replace_backup_section(&text, &entries) else {
+            return Ok(());
+        };
+
+        // Written beside the record and renamed over it. Everything else here
+        // creates a record that does not exist yet, where a torn write costs
+        // nothing; this edits a live one, and a half-written `desc` is a
+        // package the next load no longer sees as installed.
+        let staging = dir.join("desc.rvn-new");
+        std::fs::write(&staging, updated)?;
+        std::fs::rename(&staging, &desc_path)
+    }
+
     /// The stored `.INSTALL` scriptlet for an installed package, if it has one.
     pub fn install_script(&self, name: &str) -> Option<Vec<u8>> {
         let pkg = self.get(name)?;
@@ -241,10 +285,49 @@ impl LocalDb {
     }
 }
 
+/// Replaces the `%BACKUP%` block of a `desc` record, leaving every other line
+/// exactly as it was, and returns `None` when the record has no such block.
+///
+/// Reformatting the record from its parsed fields would have been shorter, and
+/// would also have reordered the keys and dropped any this version has never
+/// heard of. pacman reads these files too: a field it writes and rvn does not
+/// is still the other tool's, and losing it on the way past is not this
+/// function's decision to make.
+fn replace_backup_section(text: &str, entries: &[String]) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut lines = text.lines();
+    let mut found = false;
+
+    while let Some(line) = lines.next() {
+        out.push_str(line);
+        out.push('\n');
+        if line.trim() != "%BACKUP%" {
+            continue;
+        }
+
+        found = true;
+        for entry in entries {
+            out.push_str(entry);
+            out.push('\n');
+        }
+        // The values run to the blank line that closes the block. Skipping
+        // them here and letting the outer loop carry on is what keeps the
+        // rest of the record byte-for-byte what it was.
+        for line in lines.by_ref() {
+            if line.trim().is_empty() {
+                out.push('\n');
+                break;
+            }
+        }
+    }
+
+    found.then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pkg::Dep;
+    use crate::pkg::{BackupFile, Dep};
 
     fn temp_root(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("rvn-local-{tag}"));
@@ -314,6 +397,97 @@ mod tests {
         // modified config from an untouched one.
         assert_eq!(got.backup_hash("etc/demo.conf"), Some("feedface"));
         assert_eq!(reread.dependencies().count(), 1);
+    }
+
+    #[test]
+    fn a_backup_checksum_can_be_corrected_in_place() {
+        let root = temp_root("backup-hash");
+        let mut db = LocalDb::load(&root);
+
+        let pkg = Package {
+            name: "sudo".into(),
+            version: "1.9.16-1".into(),
+            backup: vec![
+                BackupFile::parse("etc/sudoers"),
+                BackupFile::parse("etc/sudo.conf\tfeedface"),
+            ],
+            ..Default::default()
+        };
+        db.register(&pkg, &["etc/sudoers".into()]).unwrap();
+
+        db.set_backup_hash("sudo", "etc/sudoers", "deadbeef").unwrap();
+
+        let reread = LocalDb::load(&root);
+        let got = reread.get("sudo").unwrap();
+        assert_eq!(got.backup_hash("etc/sudoers"), Some("deadbeef"));
+        // The other entry in the same block must come through untouched.
+        assert_eq!(got.backup_hash("etc/sudo.conf"), Some("feedface"));
+        // And so must every other field of the record.
+        assert_eq!(got.version, "1.9.16-1");
+        assert_eq!(reread.files("sudo").unwrap(), vec!["etc/sudoers"]);
+    }
+
+    // Correcting a checksum must not stamp the record with today's date: the
+    // installation happened when it happened, and `rvn info` reports it.
+    #[test]
+    fn correcting_a_checksum_leaves_the_install_date_alone() {
+        let root = temp_root("backup-hash-date");
+        let mut db = LocalDb::load(&root);
+
+        let pkg = Package {
+            name: "demo".into(),
+            version: "1.0-1".into(),
+            backup: vec![BackupFile::parse("etc/demo.conf")],
+            ..Default::default()
+        };
+        db.register(&pkg, &["etc/demo.conf".into()]).unwrap();
+
+        let desc = root.join("demo-1.0-1").join("desc");
+        let before = std::fs::read_to_string(&desc).unwrap();
+        let stamp = |text: &str| -> String {
+            text.lines()
+                .skip_while(|l| l.trim() != "%INSTALLDATE%")
+                .nth(1)
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        db.set_backup_hash("demo", "etc/demo.conf", "abc123").unwrap();
+        let after = std::fs::read_to_string(&desc).unwrap();
+
+        assert_eq!(stamp(&before), stamp(&after));
+        assert!(after.contains("etc/demo.conf\tabc123"), "{after}");
+    }
+
+    // Nothing to correct is not a failure, and must never invent a record of
+    // a file the package never declared.
+    #[test]
+    fn an_undeclared_backup_path_is_not_recorded() {
+        let root = temp_root("backup-hash-unknown");
+        let mut db = LocalDb::load(&root);
+
+        let pkg = Package {
+            name: "demo".into(),
+            version: "1.0-1".into(),
+            backup: vec![BackupFile::parse("etc/demo.conf")],
+            ..Default::default()
+        };
+        db.register(&pkg, &["etc/demo.conf".into()]).unwrap();
+
+        db.set_backup_hash("demo", "etc/elsewhere.conf", "abc123")
+            .unwrap();
+        db.set_backup_hash("absent", "etc/demo.conf", "abc123").unwrap();
+
+        let reread = LocalDb::load(&root);
+        let got = reread.get("demo").unwrap();
+        assert!(!got.is_backup("etc/elsewhere.conf"));
+        assert_eq!(got.backup_hash("etc/demo.conf"), None);
+    }
+
+    #[test]
+    fn a_record_without_a_backup_block_is_left_alone() {
+        let desc = "%NAME%\ndemo\n\n%VERSION%\n1.0-1\n\n";
+        assert!(replace_backup_section(desc, &["etc/demo.conf".into()]).is_none());
     }
 
     #[test]

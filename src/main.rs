@@ -210,6 +210,364 @@ fn cli() -> Command {
                 .short_flag('s')
                 .about("Refreshes the repository databases."),
         )
+        // Review the configuration files an upgrade left unmerged. Bare `rvn
+        // config` lists them, because the first thing anyone wants after being
+        // told there are three of them is to see which three.
+        .subcommand(
+            Command::new("config")
+                .about("Reviews configuration files an upgrade did not replace (.pacnew).")
+                .subcommand(Command::new("list").about("Shows every unmerged configuration file."))
+                .subcommand(
+                    Command::new("diff")
+                        .about("Shows what the package's version would change.")
+                        .arg(config_paths_arg()),
+                )
+                .subcommand(
+                    Command::new("merge")
+                        .about("Opens both versions in $EDITOR, or vimdiff.")
+                        .arg(config_paths_arg()),
+                )
+                .subcommand(
+                    Command::new("accept")
+                        .about("Takes the package's version, saving the current one.")
+                        .arg(config_paths_arg()),
+                )
+                .subcommand(
+                    Command::new("keep")
+                        .about("Discards the package's version and keeps the current one.")
+                        .arg(config_paths_arg()),
+                ),
+        )
+        // Bare `rvn cache` reports, because the question that makes somebody
+        // type it is "what is in there", and answering it deletes nothing.
+        // `clean` is the verb that removes files and it is never guessed at.
+        .subcommand(
+            Command::new("cache")
+                .about("Reports what the package cache holds, and clears what is not needed.")
+                .subcommand(
+                    Command::new("status")
+                        .about("Shows the size of the cache and what is taking it up."),
+                )
+                .subcommand(
+                    Command::new("clean")
+                        .about("Keeps the most recent versions of each package and deletes the rest.")
+                        .arg(
+                            Arg::new("keep")
+                                .long("keep")
+                                .value_name("N")
+                                .default_value("2")
+                                .help("Versions of each package to keep (the installed one always stays)"),
+                        )
+                        .arg(
+                            Arg::new("builds")
+                                .long("builds")
+                                .action(ArgAction::SetTrue)
+                                .help("Also delete the AUR build trees: checkouts, edits and downloaded sources"),
+                        )
+                        .arg(
+                            Arg::new("dry-run")
+                                .long("dry-run")
+                                .action(ArgAction::SetTrue)
+                                .help("Show what would be deleted without deleting anything"),
+                        ),
+                ),
+        )
+        // Turning a manifest into a package. Not routed through rvnd and not
+        // a privileged operation at all: it reads a manifest, stages files
+        // into a directory of its own and writes an archive. A build that
+        // needed root would be a build that could not be run by the person
+        // who wrote the manifest.
+        .subcommand(
+            Command::new("build")
+                .about("Builds a package from a package.toml.")
+                .arg(
+                    Arg::new("manifests")
+                        .help("package.toml file(s), or the directories holding them")
+                        .required(true)
+                        .num_args(1..)
+                        .action(ArgAction::Append),
+                )
+                .arg(
+                    Arg::new("outdir")
+                        .long("outdir")
+                        .value_name("DIR")
+                        .help("Where the finished packages go (default: the working directory)"),
+                )
+                .arg(
+                    Arg::new("no-build")
+                        .long("no-build")
+                        .action(ArgAction::SetTrue)
+                        .help("Package a tree that is already built, rather than running [build]"),
+                )
+                .arg(
+                    Arg::new("srcdir")
+                        .long("srcdir")
+                        .value_name("DIR")
+                        .help("The built source tree the manifest's src paths are relative to"),
+                )
+                .arg(
+                    Arg::new("repo")
+                        .long("repo")
+                        .value_name("NAME")
+                        .help("Also rebuild NAME.db in the output directory"),
+                )
+                .arg(no_files_arg())
+                .arg(sign_arg())
+                .arg(no_sign_arg())
+                .arg(key_arg()),
+        )
+        // Named after the tool it replaces, because somebody who has run a
+        // repository before will look for exactly this word.
+        .subcommand(
+            Command::new("repo-add")
+                .about("Builds a repository database from a directory of packages.")
+                .arg(
+                    Arg::new("directory")
+                        .help("The directory holding the packages")
+                        .required(true)
+                        .num_args(1),
+                )
+                .arg(
+                    Arg::new("name")
+                        .long("name")
+                        .value_name("NAME")
+                        .help("What to call the repository (default: the directory's name)"),
+                )
+                .arg(no_files_arg())
+                .arg(sign_arg())
+                .arg(no_sign_arg())
+                .arg(key_arg()),
+        )
+        // Bare `rvn rollback` reports rather than acting, for the same reason
+        // bare `rvn cache` does: the question that makes somebody type it is
+        // "what can I go back to", and answering it changes nothing.
+        .subcommand(
+            Command::new("rollback")
+                .about("Reinstalls the previous version of a package from the cache.")
+                .arg(
+                    Arg::new("packages")
+                        .help("The package to roll back; omit to see what can be")
+                        .num_args(0..=1)
+                        .action(ArgAction::Append),
+                )
+                .arg(
+                    Arg::new("dry-run")
+                        .long("dry-run")
+                        .action(ArgAction::SetTrue)
+                        .help("Show what would be reinstalled without reinstalling it"),
+                ),
+        )
+        // Not a package operation, and here anyway. See `daemon::Op::Service`
+        // for the argument: raven-init's control socket is root-only by
+        // design, rvnd is already the root process that brokers verbs for
+        // unprivileged front-ends, and a second daemon doing the same job for
+        // a second socket would be two policies to keep in step.
+        .subcommand(
+            Command::new("service")
+                .about("Turns one of this machine's own daemons on or off.")
+                .long_about(
+                    "Turns one of this machine's own daemons on or off.\n\n\
+                     Only names a service this machine already ships a definition for, \
+                     under /usr/share/raven/services or /etc/raven/init.d. `enable` \
+                     starts it now and at every boot, which is what a switch in Raven \
+                     Settings does; `start` is this boot only. `status` reads what \
+                     raven-init publishes and needs no privilege at all.",
+                )
+                .arg(
+                    Arg::new("action")
+                        .help("enable, disable, start, stop, restart or status")
+                        .required(true)
+                        .value_parser([
+                            "enable", "disable", "start", "stop", "restart", "status",
+                        ]),
+                )
+                .arg(
+                    Arg::new("service")
+                        .help("The service, e.g. faced or fprintd")
+                        .required(true),
+                ),
+        )
+}
+
+fn sign_arg() -> Arg {
+    Arg::new("sign")
+        .long("sign")
+        .action(ArgAction::SetTrue)
+        .help("Sign what is produced, failing if no key is configured")
+}
+
+fn no_sign_arg() -> Arg {
+    Arg::new("no-sign")
+        .long("no-sign")
+        .action(ArgAction::SetTrue)
+        .conflicts_with_all(["sign", "key"])
+        .help("Do not sign, even though a key is configured")
+}
+
+fn key_arg() -> Arg {
+    Arg::new("key")
+        .long("key")
+        .value_name("KEY")
+        .help("A gpg key id, or the path to a secret key file; implies --sign")
+}
+
+/// The opt-out for the `<repo>.files` database.
+///
+/// Phrased as an opt-out because `repo-add` writes both databases and a
+/// repository missing one of them is the odd one out. See
+/// [`rvn::repodb::Files`] for the case where skipping it is the right call.
+fn no_files_arg() -> Arg {
+    Arg::new("no-files")
+        .long("no-files")
+        .action(ArgAction::SetTrue)
+        .help("Skip NAME.files, the database `pacman -F` reads")
+}
+
+/// Whether this run writes the file-list database.
+fn files(sub: &ArgMatches) -> rvn::repodb::Files {
+    if sub.get_flag("no-files") {
+        rvn::repodb::Files::Skip
+    } else {
+        rvn::repodb::Files::Write
+    }
+}
+
+/// Which signing rule the flags add up to.
+///
+/// Signing when a key is configured and nothing was said is deliberate, and
+/// it is the same reading the rest of the crate gives a configuration file it
+/// finds: somebody who wrote down a signing key wrote down that packages from
+/// this machine are signed, and quietly producing unsigned ones would ignore
+/// it. `--no-sign` is how that is overridden for one run.
+fn signing(sub: &ArgMatches) -> ops::build::Signing {
+    if sub.get_flag("no-sign") {
+        return ops::build::Signing::Never;
+    }
+    if let Some(key) = sub.get_one::<String>("key") {
+        return ops::build::Signing::Key(key.clone());
+    }
+    if sub.get_flag("sign") {
+        return ops::build::Signing::Required;
+    }
+    ops::build::Signing::Configured
+}
+
+/// The files a `rvn config` verb should act on; all of them when none are
+/// named, which is how a review of a machine nobody has looked at starts.
+fn config_paths_arg() -> Arg {
+    Arg::new("paths")
+        .help("File(s) to act on; omit for every one waiting")
+        .num_args(0..)
+        .action(ArgAction::Append)
+}
+
+/// `rvn service`: read what raven-init publishes, or ask somebody with the
+/// privilege to change it.
+///
+/// Three paths, and which one is taken is decided by what the request needs
+/// rather than by a flag:
+///
+///   * `status` reads `/run/raven-init/services/NAME`, which raven-init
+///     writes mode 0644 exactly so that this question does not need root.
+///     No daemon, no prompt, no socket.
+///   * As root -- `sudo rvn service`, or an image build -- the work is done
+///     here, against raven-init's own socket.
+///   * Otherwise it goes to rvnd, which does the same work and asks the
+///     human first if the policy says to. This is the path Raven Settings
+///     takes, through `rvn --json`, exactly as Raven Store takes it for an
+///     install.
+fn service_command(matches: &ArgMatches, action: &str, name: &str) -> Result<(), String> {
+    use rvn::daemon::{Reach, Replay, ServiceAction, reach, request, SOCKET_PATH};
+
+    let json = matches.get_flag("json");
+
+    // Checked here as well as in rvnd, which checks everything that reaches
+    // it. This one is for the person: a name with a slash or a space in it
+    // gets a sentence about the name, rather than a round trip and whatever
+    // the daemon makes of it.
+    if !rvn::initctl::valid_service_name(name) {
+        return Err(format!("refusing service name {name:?}"));
+    }
+
+    if action == "status" {
+        let path = std::path::Path::new(rvn::initctl::STATUS_DIR)
+            .join("services")
+            .join(name);
+        let text = std::fs::read_to_string(&path).map_err(|_| {
+            format!(
+                "raven-init says nothing about '{name}'; `rvn service status` reads {}",
+                path.display()
+            )
+        })?;
+        if json {
+            Ui::json().emit("service", serde_json::json!({ "service": name, "status": text }));
+        } else {
+            print!("{text}");
+        }
+        return Ok(());
+    }
+
+    let action = match action {
+        "enable" => ServiceAction::Enable,
+        "disable" => ServiceAction::Disable,
+        "start" => ServiceAction::Start,
+        "stop" => ServiceAction::Stop,
+        "restart" => ServiceAction::Restart,
+        other => return Err(format!("no such action '{other}'")),
+    };
+
+    if ops::is_root() {
+        let ui = if json { Ui::json() } else { Ui::new() };
+        let mut failure = None;
+        rvn::daemon::run_service(action, name, &mut |kind, message| match kind {
+            "failed" => failure = Some(message),
+            "info" => ui.info(&message),
+            _ => ui.ok(&message),
+        });
+        return match failure {
+            Some(message) => Err(message),
+            None => Ok(()),
+        };
+    }
+
+    let socket_override = std::env::var("RVN_SOCKET").ok();
+    let socket = std::path::Path::new(socket_override.as_deref().unwrap_or(SOCKET_PATH));
+    match reach(socket) {
+        Reach::Ok => {}
+        // Unlike an install, there is no in-process fallback to warn about
+        // and fall through to: changing a service needs a privileged channel
+        // to PID 1, and an unprivileged rvn has none.
+        Reach::Absent => {
+            return Err(
+                "rvnd is not running, so services cannot be changed from here: start it with `sudo raven-rc start rvnd`, or use `sudo raven-rc` in a terminal"
+                    .into(),
+            );
+        }
+        Reach::Denied => {
+            return Err(format!(
+                "not allowed to use rvnd: {} is for members of the {} group; use sudo, or add yourself to the group and log in again",
+                SOCKET_PATH,
+                rvn::daemon::DEFAULT_GROUP
+            ));
+        }
+        Reach::Other(e) => return Err(format!("rvnd: {e}")),
+    }
+
+    let req = rvn::daemon::Request {
+        op: Some(rvn::daemon::Op::Service),
+        service: Some(name.to_string()),
+        action: Some(action),
+        ..Default::default()
+    };
+
+    if json {
+        return request(socket, &req, |line| println!("{line}"));
+    }
+    let ui = Ui::new();
+    let mut replay = Replay::new(&ui, false);
+    let result = request(socket, &req, |line| replay.event(line));
+    replay.finish();
+    result
 }
 
 /// Run a privileged operation through rvnd when this process is not root.
@@ -300,7 +658,14 @@ fn via_daemon(matches: &ArgMatches, sub: &ArgMatches, mut req: rvn::daemon::Requ
         if dry_run_asked {
             return Some(Ok(()));
         }
-        if !ui.confirm("proceed?", true) {
+        // Yes, except for a rollback. Every other question here confirms the
+        // thing the person typed, so the default is the answer they have
+        // already given; a rollback is a downgrade, which is the direction
+        // that surprises people, and `ops::rollback` defaults its own
+        // confirmation to no for that reason. Running it through rvnd must
+        // not quietly turn that no into a yes.
+        let default = req.op != Some(rvn::daemon::Op::Rollback);
+        if !ui.confirm("proceed?", default) {
             return Some(Err("cancelled".into()));
         }
     }
@@ -576,6 +941,154 @@ fn main() -> ExitCode {
                 ops::update::run(&mut ctx, &packages(sub), refresh).map(|_| ())
             })
         }),
+
+        // Never through rvnd: `list` and `diff` read files anyone may read and
+        // must not need a daemon at all, and the three that write are asking
+        // an administrator a question about their own /etc. When that question
+        // needs root it says so and names sudo, rather than handing the daemon
+        // a file path and a verb that overwrite configuration.
+        Some(("config", sub)) => {
+            let (verb, args) = match sub.subcommand() {
+                Some((verb, args)) => (verb, Some(args)),
+                None => ("list", None),
+            };
+            match ops::config::Action::parse(verb) {
+                None => Err(format!("rvn config has no `{verb}`")),
+                Some(action) => {
+                    // try_get_many, not get_many: `list` declares no paths at
+                    // all, and asking a subcommand for an argument it never
+                    // defined is a panic rather than an empty answer. Same
+                    // reason build_context reaches for --dry-run that way.
+                    let paths: Vec<String> = args
+                        .and_then(|a| a.try_get_many::<String>("paths").ok().flatten())
+                        .unwrap_or_default()
+                        .cloned()
+                        .collect();
+                    build_context(&matches, args.unwrap_or(sub))
+                        .and_then(|mut ctx| ops::config::run(&mut ctx, action, &paths))
+                }
+            }
+        }
+
+        // Never through rvnd either, and for the same reason as `config`:
+        // `status` reads directories anybody may read, and `clean` is an
+        // administrator deciding what to delete from their own disk rather
+        // than a package operation the daemon exists to carry out. When it
+        // needs root it says so and names sudo.
+        Some(("cache", sub)) => {
+            let (verb, args) = match sub.subcommand() {
+                Some((verb, args)) => (verb, Some(args)),
+                None => ("status", None),
+            };
+            // A `--keep` that is not a number is a mistake worth stopping for:
+            // falling back to the default would delete more than the person
+            // asked to keep, and they would not find out until it was gone.
+            // try_get_one, not get_one: `status` declares neither --keep nor
+            // --builds, and asking a subcommand for an argument it never
+            // defined is a panic rather than an empty answer. Same reason
+            // build_context reaches for --dry-run that way.
+            let keep = match args.and_then(|a| a.try_get_one::<String>("keep").ok().flatten()) {
+                Some(raw) => raw
+                    .parse::<usize>()
+                    .map_err(|_| format!("--keep wants a number of versions, not {raw:?}")),
+                None => Ok(rvn::cache::DEFAULT_KEEP),
+            };
+            match (ops::cache::Action::parse(verb), keep) {
+                (None, _) => Err(format!("rvn cache has no `{verb}`")),
+                (_, Err(message)) => Err(message),
+                (Some(action), Ok(keep)) => {
+                    let options = ops::cache::Options {
+                        keep,
+                        builds: args.is_some_and(|a| {
+                            a.try_get_one::<bool>("builds").ok().flatten().copied() == Some(true)
+                        }),
+                    };
+                    build_context(&matches, args.unwrap_or(sub))
+                        .and_then(|mut ctx| ops::cache::run(&mut ctx, action, &options))
+                }
+            }
+        }
+
+        // Never through rvnd: building a package needs no root, and a daemon
+        // that ran arbitrary `[build]` commands as root on request would undo
+        // everything the AUR build path (ops::install::build_command) exists
+        // to prevent.
+        Some(("build", sub)) => {
+            let options = ops::build::Options {
+                outdir: sub
+                    .get_one::<String>("outdir")
+                    .map(PathBuf::from)
+                    .unwrap_or_default(),
+                run_build: !sub.get_flag("no-build"),
+                source_dir: sub.get_one::<String>("srcdir").map(PathBuf::from),
+                repo: sub.get_one::<String>("repo").cloned(),
+                signing: signing(sub),
+                files: files(sub),
+            };
+            let manifests: Vec<String> = sub
+                .get_many::<String>("manifests")
+                .unwrap_or_default()
+                .cloned()
+                .collect();
+            build_context(&matches, sub)
+                .and_then(|mut ctx| ops::build::run(&mut ctx, &manifests, &options))
+        }
+
+        Some(("repo-add", sub)) => {
+            let directory = PathBuf::from(
+                sub.get_one::<String>("directory")
+                    .expect("clap requires the directory"),
+            );
+            let name = sub.get_one::<String>("name").cloned();
+            let signing = signing(sub);
+            let files = files(sub);
+            build_context(&matches, sub).and_then(|mut ctx| {
+                ops::build::repo_add(&mut ctx, &directory, name.as_deref(), &signing, files)
+            })
+        }
+
+        // Rolling back writes to the install root, so it goes through rvnd
+        // like every other privileged operation and is audited the same way;
+        // `rvn::policy::Class::of` explains why it is classed `repo`.
+        //
+        // Only the named form does. Bare `rvn rollback` reports what could be
+        // rolled back, which is reading two world-readable databases: sending
+        // it to the daemon would put an authorization prompt in front of a
+        // question, and hold rvnd's transaction lock to answer it.
+        Some(("rollback", sub)) => {
+            let package = sub
+                .get_many::<String>("packages")
+                .unwrap_or_default()
+                .next()
+                .cloned();
+            let daemon = package.clone().and_then(|package| {
+                via_daemon(
+                    &matches,
+                    sub,
+                    rvn::daemon::Request {
+                        op: Some(rvn::daemon::Op::Rollback),
+                        packages: vec![package],
+                        ..Default::default()
+                    },
+                )
+            });
+            daemon.unwrap_or_else(|| {
+                build_context(&matches, sub)
+                    .and_then(|mut ctx| ops::rollback::run(&mut ctx, package.as_deref()))
+            })
+        }
+
+        Some(("service", sub)) => {
+            let action = sub
+                .get_one::<String>("action")
+                .expect("required")
+                .to_string();
+            let name = sub
+                .get_one::<String>("service")
+                .expect("required")
+                .to_string();
+            service_command(&matches, &action, &name)
+        }
 
         _ => unreachable!("subcommand_required(true) guarantees a subcommand"),
     };

@@ -8,6 +8,11 @@ prefix = "/usr/local"
 bindir = "{{prefix}}/bin"
 binary = "rvn"
 target = "target/release/{{binary}}"
+# Configuration goes to /etc whatever prefix says, because the binaries read it
+# from paths compiled into them -- `policy::DEFAULT_PATH` is /etc/raven/rvnd.toml
+# and `sign::CONFIG` is etc/rvn/build.toml under the install root. A copy under
+# ~/.local/etc would be a file nothing ever reads.
+sysconfdir = "/etc"
 
 [commands]
 
@@ -34,8 +39,23 @@ desc = "Format the code with rustfmt"
 alias = ["fmt", "f"]
 run = ["cargo fmt --all"]
 
+# Installing is the binaries and the reference configuration. The two files are
+# documentation that happens to be machine-readable -- every value in them is a
+# default and the whole of each file is optional -- but documentation that never
+# leaves the source tree is documentation nobody reads.
+#
+# A file that is already there is left exactly as it is and the shipped version
+# is written beside it as `.pacnew`. That is the convention rvn itself applies to
+# every `backup` file in every package it installs, and `rvn config list` walks
+# /etc for precisely that suffix -- so a .pacnew left here turns up in the same
+# review desk as one an upgrade left, and `rvn config diff|merge|accept|keep`
+# settle it the same way. Refusing to overwrite matters more for these two than
+# for an ordinary file: rvnd.toml says which operations need a human to agree to
+# them, and an administrator who has set `on_auth_unavailable = "deny"` would be
+# put back to failing open by an install that clobbered it, silently, at exactly
+# the moment they thought they were tightening the machine up.
 [commands.install]
-desc = "Install rvn to /usr/local/bin"
+desc = "Install rvn to /usr/local/bin and its reference configuration to /etc"
 dep = ["build"]
 escalate = true
 run = [
@@ -44,9 +64,14 @@ run = [
   "install -m 755 {{target}} {{bindir}}/{{binary}}",
   "install -m 755 target/release/rvnd {{bindir}}/rvnd",
   "echo \"Installed {{binary}} and rvnd to {{bindir}}\"",
+  "for config in raven/rvnd.toml rvn/build.toml; do src=\"etc/$config\"; dest=\"{{sysconfdir}}/$config\"; install -d \"${dest%/*}\" || exit 1; if [ ! -e \"$dest\" ]; then install -m 644 \"$src\" \"$dest\" || exit 1; echo \"Installed $dest\"; elif cmp -s \"$src\" \"$dest\"; then echo \"Unchanged $dest\"; else install -m 644 \"$src\" \"$dest.pacnew\" || exit 1; echo \"Kept $dest (yours); shipped version is $dest.pacnew\"; echo \"  review it with: rvn config diff $dest\"; fi; done",
   "echo \"Run 'rvn --version' to verify.\"",
 ]
 
+# The configuration is deliberately left behind. An administrator's policy
+# outliving the binary it configures is the harmless direction to be wrong in;
+# deleting a rvnd.toml somebody wrote because a binary was reinstalled the long
+# way round is not.
 [commands.uninstall]
 desc = "Uninstall rvn from /usr/local/bin"
 escalate = true
@@ -54,6 +79,7 @@ run = [
   "echo \"Removing {{bindir}}/{{binary}}...\"",
   "rm -f {{bindir}}/{{binary}} {{bindir}}/rvnd",
   "echo \"Uninstalled {{binary}}\"",
+  "for config in raven/rvnd.toml rvn/build.toml; do if [ -e \"{{sysconfdir}}/$config\" ]; then echo \"Left in place: {{sysconfdir}}/$config\"; fi; done",
 ]
 
 [commands.clean]

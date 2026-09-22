@@ -1,8 +1,17 @@
 //! HTTP downloads with mirror failover and progress reporting.
+//!
+//! `file://` is served from the filesystem rather than through ureq, which
+//! refuses the scheme outright ("http: invalid format"). That matters because
+//! a repository built by `rvn repo-add` into a directory is the ordinary way
+//! to try RavenLinux's own packages before anything is published, and
+//! `Server = file:///srv/raven` in `pacman.conf` is how pacman has always
+//! spelled it. The branch lives inside [`stream_to`] so that mirror failover,
+//! the `.part`-then-rename dance, progress accounting and the absent-quorum
+//! rule in [`download_optional`] all keep working without knowing about it.
 
 use crate::ui::progress::Progress;
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const USER_AGENT: &str = concat!("rvn/", env!("CARGO_PKG_VERSION"));
@@ -98,6 +107,179 @@ fn probe_agent() -> ureq::Agent {
         .into()
 }
 
+/// The scheme a repository served straight out of a directory uses.
+const FILE_SCHEME: &str = "file://";
+
+/// Whether this URL names a path on this machine rather than a server.
+///
+/// Compared case-insensitively because a scheme is case-insensitive in the
+/// URL grammar, and somebody hand-editing `pacman.conf` may well write
+/// `FILE://`.
+fn is_file_url(url: &str) -> bool {
+    url.len() >= FILE_SCHEME.len() && url[..FILE_SCHEME.len()].eq_ignore_ascii_case(FILE_SCHEME)
+}
+
+/// Decodes the `%XX` escapes a URL may carry, as bytes.
+///
+/// A `Server =` line is usually written with none, but the other half of
+/// every URL rvn builds is a filename out of a repository database, and a
+/// path with a space in it has to arrive as `%20` to be a URL at all. A `%`
+/// that does not begin a valid escape is left alone rather than rejected,
+/// because it is far more likely to be a literal character in a filename
+/// than a truncated escape.
+///
+/// Bytes rather than a `String`, because a path on Linux is bytes: decoding
+/// through UTF-8 would replace anything an escape sequence produced that is
+/// not valid UTF-8, and then look for a file under a name nothing has.
+fn percent_decode(text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let hex = |b: u8| (b as char).to_digit(16);
+    let mut i = 0;
+    while i < bytes.len() {
+        match (bytes[i], bytes.get(i + 1), bytes.get(i + 2)) {
+            (b'%', Some(&hi), Some(&lo)) => match (hex(hi), hex(lo)) {
+                (Some(hi), Some(lo)) => {
+                    out.push((hi * 16 + lo) as u8);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            (b, _, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The path a `file://` URL names, or why rvn will not read it.
+///
+/// The two refusals are not paranoia about the operator's own `Server =`
+/// line. Every URL rvn fetches is that line joined to a filename taken out of
+/// a repository database, and the database is the half rvn did not write: a
+/// `%FILENAME%` of `../../../etc/shadow` would otherwise walk straight out of
+/// the directory being served and hand its contents to the verifier as though
+/// it were a package. Rejecting any `..` component — after decoding, so an
+/// escaped `%2e%2e` is caught too — keeps every read inside the directory the
+/// operator pointed at. A non-local authority is refused because `file://` to
+/// another host is not a thing rvn can honour, and quietly reading the local
+/// path of that name instead would be worse than saying so.
+fn file_path(url: &str) -> Result<PathBuf, FetchError> {
+    let rest = &url[FILE_SCHEME.len()..];
+    // `file:///srv/raven` is the ordinary spelling: empty authority, then an
+    // absolute path. `file://localhost/srv/raven` means the same thing.
+    let path = match rest.find('/') {
+        Some(slash) => {
+            let authority = &rest[..slash];
+            if !authority.is_empty() && !authority.eq_ignore_ascii_case("localhost") {
+                return Err(FetchError::Transport {
+                    url: url.to_string(),
+                    reason: format!("file:// cannot reach the host {authority:?}"),
+                });
+            }
+            &rest[slash..]
+        }
+        None => {
+            return Err(FetchError::Transport {
+                url: url.to_string(),
+                reason: "file:// URL has no path".into(),
+            });
+        }
+    };
+
+    use std::os::unix::ffi::OsStringExt;
+    let path = PathBuf::from(std::ffi::OsString::from_vec(percent_decode(path)));
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(FetchError::Transport {
+            url: url.to_string(),
+            reason: "refusing a file:// path that climbs out of its directory with ..".into(),
+        });
+    }
+
+    Ok(path)
+}
+
+/// Copies a local file into `sink`, reporting bytes the way a download does.
+///
+/// A missing file is reported as HTTP 404 rather than as an I/O error, which
+/// looks like a lie and is not: [`download_optional`] decides whether a
+/// repository publishes a `.db.sig` at all by counting how many mirrors
+/// answered "no such file", and a local repository that ships no signature
+/// has to be able to give that same answer or every sync of it would stall on
+/// "could not establish". Every other I/O failure — a directory without
+/// permission to read it, a disk error — leaves the question genuinely open
+/// and is reported as a transport failure, exactly as a refused connection is.
+fn copy_local<W: Write>(
+    url: &str,
+    sink: &mut W,
+    mut on_bytes: impl FnMut(u64),
+) -> Result<u64, FetchError> {
+    let path = file_path(url)?;
+
+    let local = |e: io::Error| -> FetchError {
+        if e.kind() == io::ErrorKind::NotFound {
+            FetchError::Status {
+                url: url.to_string(),
+                code: 404,
+            }
+        } else {
+            FetchError::Transport {
+                url: url.to_string(),
+                reason: e.to_string(),
+            }
+        }
+    };
+
+    // Followed rather than inspected, because `repo-add` publishes `<repo>.db`
+    // as a symlink to `<repo>.db.tar.gz` and refusing symlinks would make
+    // every repository this crate writes unreadable by it.
+    let meta = std::fs::metadata(&path).map_err(local)?;
+    if !meta.is_file() {
+        // A directory or a device node is not a failure to serve the file; it
+        // is the file not being there in any sense rvn can use, and reading
+        // /dev/zero would never end.
+        return Err(FetchError::Status {
+            url: url.to_string(),
+            code: 404,
+        });
+    }
+    // Remembered before the copy for the same reason the Content-Length is:
+    // a file being rewritten underneath us — `rvn repo-add` regenerating the
+    // database while a sync reads it — must not be renamed into place short.
+    let expected = meta.len();
+
+    let mut file = std::fs::File::open(&path).map_err(local)?;
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        sink.write_all(&buffer[..n])?;
+        total += n as u64;
+        on_bytes(n as u64);
+    }
+
+    if total != expected {
+        return Err(FetchError::Truncated {
+            url: url.to_string(),
+            expected,
+            received: total,
+        });
+    }
+
+    Ok(total)
+}
+
 /// Streams `url` into `sink`, reporting bytes as they arrive.
 fn stream_to<W: Write>(
     agent: &ureq::Agent,
@@ -105,6 +287,13 @@ fn stream_to<W: Write>(
     sink: &mut W,
     mut on_bytes: impl FnMut(u64),
 ) -> Result<u64, FetchError> {
+    // Decided here rather than at each call site so that every caller —
+    // mirror failover, the optional-file probe, `get_string` — gets local
+    // repositories for free and none of them has to learn a second code path.
+    if is_file_url(url) {
+        return copy_local(url, sink, on_bytes);
+    }
+
     // A refused connection and a 404 are different problems, and reporting a
     // timeout as "HTTP 0" sends the reader looking in the wrong place.
     let mut response = agent.get(url).call().map_err(|e| match &e {
@@ -401,6 +590,125 @@ mod tests {
         // to each one.
         assert!(OPTIONAL_MIRROR_LIMIT <= 5);
         assert!(ABSENT_QUORUM <= OPTIONAL_MIRROR_LIMIT);
+    }
+
+    /// A directory of this run's own, so the file:// tests cannot collide
+    /// with each other or with a previous run left behind.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rvn-file-url-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_file_url_is_recognised_whatever_its_case() {
+        assert!(is_file_url("file:///srv/raven/raven.db"));
+        assert!(is_file_url("FILE:///srv/raven/raven.db"));
+        assert!(!is_file_url("https://example.invalid/raven.db"));
+        assert!(!is_file_url("file:/srv/raven"));
+    }
+
+    #[test]
+    fn a_file_url_resolves_to_its_path() {
+        assert_eq!(
+            file_path("file:///srv/raven/raven.db").unwrap(),
+            Path::new("/srv/raven/raven.db")
+        );
+        // localhost is the spelling of "this machine" the URL grammar allows.
+        assert_eq!(
+            file_path("file://localhost/srv/raven/raven.db").unwrap(),
+            Path::new("/srv/raven/raven.db")
+        );
+        // A space in a directory name arrives escaped or it is not a URL.
+        assert_eq!(
+            file_path("file:///srv/my%20repo/raven.db").unwrap(),
+            Path::new("/srv/my repo/raven.db")
+        );
+    }
+
+    #[test]
+    fn a_file_url_may_not_climb_out_of_its_directory() {
+        // Regression: the filename half of every URL comes out of a
+        // repository database, so `%FILENAME%` is attacker-controlled for any
+        // repository rvn did not build itself.
+        for url in [
+            "file:///srv/raven/../../etc/shadow",
+            // The same attack spelled in escapes, which is why decoding has
+            // to happen before the check rather than after it.
+            "file:///srv/raven/%2e%2e/%2e%2e/etc/shadow",
+        ] {
+            match file_path(url) {
+                Err(FetchError::Transport { reason, .. }) => assert!(reason.contains("..")),
+                other => panic!("expected a refusal for {url}, got {other:?}"),
+            }
+        }
+        // A file:// URL naming another host is refused rather than silently
+        // read from this one.
+        assert!(matches!(
+            file_path("file://elsewhere.invalid/srv/raven.db"),
+            Err(FetchError::Transport { .. })
+        ));
+    }
+
+    #[test]
+    fn a_local_repository_downloads_like_any_mirror() {
+        let dir = scratch("download");
+        let source = dir.join("widget-1.0-1-x86_64.pkg.tar.zst");
+        std::fs::write(&source, b"not really a package, but it is bytes").unwrap();
+
+        let dest = dir.join("cached.pkg.tar.zst");
+        let url = format!("file://{}", source.display());
+        let total = download_with_mirrors(&[url], &dest, None).unwrap();
+
+        assert_eq!(total, 37);
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"not really a package, but it is bytes"
+        );
+        // The same .part-then-rename contract every other download honours.
+        assert!(!dest.with_extension("tar.zst.part").exists());
+    }
+
+    #[test]
+    fn a_missing_local_file_fails_over_to_the_next_mirror() {
+        let dir = scratch("failover");
+        let real = dir.join("raven.db");
+        std::fs::write(&real, b"database").unwrap();
+
+        let dest = dir.join("fetched.db");
+        let urls = vec![
+            format!("file://{}", dir.join("absent.db").display()),
+            format!("file://{}", real.display()),
+        ];
+        assert_eq!(download_with_mirrors(&urls, &dest, None).unwrap(), 8);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"database");
+    }
+
+    #[test]
+    fn an_absent_local_signature_reads_as_not_published() {
+        // A directory-served repository ships no `<repo>.db.sig`, exactly as
+        // Arch's own repositories do not. Reporting that as "could not ask"
+        // would strand every local repository at sync time, so a missing
+        // local file has to answer the question the way a 404 does.
+        let dir = scratch("optional");
+        let dest = dir.join("raven.db.sig");
+        let urls = vec![format!("file://{}", dir.join("raven.db.sig").display())];
+        match download_optional(&urls, &dest) {
+            Optional::NotPublished => {}
+            other => panic!("expected NotPublished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_directory_is_not_a_file_to_fetch() {
+        let dir = scratch("directory");
+        let dest = dir.join("out");
+        let urls = vec![format!("file://{}", dir.display())];
+        match download_optional(&urls, &dest) {
+            Optional::NotPublished => {}
+            other => panic!("expected NotPublished, got {other:?}"),
+        }
     }
 
     #[test]

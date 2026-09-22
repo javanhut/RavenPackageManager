@@ -45,6 +45,31 @@ fn deps(fields: &HashMap<String, Vec<String>>, key: &str) -> Vec<Dep> {
     list(fields, key).iter().map(|s| Dep::parse(s)).collect()
 }
 
+/// Whether a `%FILENAME%` may be used as a file name.
+///
+/// `%FILENAME%` is the one field in a repository database that rvn turns
+/// straight into a path: the download destination is `<cache>/<filename>` and
+/// the download URL is `<server>/<filename>`. Neither is a name rvn chose, and
+/// `Path::join` replaces the whole path when what it is given is absolute, so
+/// a database record carrying `%FILENAME%` = `/usr/lib/libc.so.6` would aim a
+/// root-owned write at libc itself -- and `../../..` escapes the cache just as
+/// well, because `join` does not normalise a parent component away either.
+///
+/// A package archive is a plain name in one directory. Anything that is not
+/// one is a record trying to be a path, so it is refused here, at the parse,
+/// rather than at each of the places that later builds a path out of it.
+pub fn is_safe_archive_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        // A separator covers the absolute case and the parent-directory case
+        // at once: neither can be spelled without one.
+        && !name.contains('/')
+        // A NUL cannot reach a syscall as part of a path, and a name carrying
+        // one is either corrupt or an attempt to truncate what follows it.
+        && !name.contains('\0')
+}
+
 /// Builds a [`Package`] from a parsed desc record.
 pub fn package_from_fields(fields: &HashMap<String, Vec<String>>, origin: Origin) -> Option<Package> {
     let name = one(fields, "NAME")?;
@@ -64,7 +89,11 @@ pub fn package_from_fields(fields: &HashMap<String, Vec<String>>, origin: Origin
         optdepends: deps(fields, "OPTDEPENDS"),
         conflicts: deps(fields, "CONFLICTS"),
         replaces: deps(fields, "REPLACES"),
-        filename: one(fields, "FILENAME"),
+        // A record whose filename is a path rather than a name is dropped
+        // rather than trusted; see [`is_safe_archive_name`]. Every consumer
+        // then sees the same thing it sees for a record that never carried a
+        // filename at all, which they all already refuse to act on.
+        filename: one(fields, "FILENAME").filter(|name| is_safe_archive_name(name)),
         csize: num(fields, "CSIZE"),
         // Sync databases call the installed size ISIZE; the local database
         // calls the same value SIZE.
@@ -211,6 +240,53 @@ go-compiler=1.22.0
         let pkg = parse_package("%NAME%\nfoo\n\n%VERSION%\n1.0-1\n", Origin::Local).unwrap();
         assert_eq!(pkg.install_reason, InstallReason::Explicit);
         assert!(pkg.backup.is_empty());
+    }
+
+    /// `%FILENAME%` becomes both a path under the cache and the tail of a
+    /// download URL, so a record that spells a path there is a repository (or
+    /// a mirror answering for one) choosing where root writes. The name has to
+    /// be dropped at the parse, where every consumer inherits the refusal.
+    #[test]
+    fn a_filename_that_is_a_path_is_not_a_filename() {
+        for hostile in [
+            // Absolute: `Path::join` throws the cache prefix away entirely and
+            // the write lands on the real libc.
+            "/usr/lib/libc.so.6",
+            // Relative escape: `join` does not normalise `..` away.
+            "../../../etc/cron.d/x",
+            "./foo.pkg.tar.zst",
+            // A separator anywhere is enough to reshape the URL as well.
+            "sub/dir/foo.pkg.tar.zst",
+            "foo.pkg.tar.zst/",
+            ".",
+            "..",
+            "",
+            "foo\0.pkg.tar.zst",
+        ] {
+            assert!(
+                !is_safe_archive_name(hostile),
+                "{hostile:?} was accepted as a file name"
+            );
+            let text = format!("%NAME%\nfoo\n\n%VERSION%\n1.0-1\n\n%FILENAME%\n{hostile}\n");
+            let pkg = parse_package(&text, Origin::Repo("extra".into())).unwrap();
+            assert_eq!(
+                pkg.filename, None,
+                "{hostile:?} survived the parse as a filename"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_archive_name_still_parses() {
+        assert!(is_safe_archive_name("go-2:1.22.0-1-x86_64.pkg.tar.zst"));
+        // A name with dots and a dash in it is ordinary; only separators are
+        // the problem.
+        assert!(is_safe_archive_name("lib32-glibc-2.39-1-x86_64.pkg.tar.zst"));
+        let pkg = parse_package(SAMPLE, Origin::Repo("extra".into())).unwrap();
+        assert_eq!(
+            pkg.filename.as_deref(),
+            Some("go-2:1.22.0-1-x86_64.pkg.tar.zst")
+        );
     }
 
     #[test]

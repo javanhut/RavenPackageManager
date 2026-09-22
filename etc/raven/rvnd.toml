@@ -1,0 +1,244 @@
+# /etc/raven/rvnd.toml -- rvnd, the RavenLinux package manager's daemon.
+#
+# Every value here is a default. The whole file is optional and so is every
+# field in it, so an installed machine needs none of this -- it is shipped as a
+# reference for the values that exist, not as a file you must maintain.
+#
+# A file that is present but does not parse is a hard error: rvnd refuses to
+# start rather than silently falling back to defaults, because falling back
+# would quietly ignore a policy somebody wrote down and believed.
+#
+# `rvnd --print-policy` writes this file out again from inside the binary, so
+# `rvnd --print-policy | sudo tee /etc/raven/rvnd.toml` gets you a copy to edit
+# that is guaranteed to match the version of rvnd you are running. It is the
+# same text you are reading: the file is compiled into the binary and a test
+# parses it and asserts that every value in it is the value the code defaults
+# to, so the documentation and the behaviour cannot drift apart.
+#
+#
+# WHAT THIS FILE IS FOR
+#
+# Installing a package is root. Not "needs root to write to /usr" -- root in
+# the full sense, because a package's install scriptlets run as root by design
+# and a package built from the AUR runs a PKGBUILD that somebody on the
+# internet wrote. If you can make rvnd install a package of your choosing, you
+# can run code of your choosing as root on this machine. There is no smaller
+# version of that statement.
+#
+# rvnd exists so that the desktop does not have to shell out to sudo for this.
+# It listens on /run/rvn/ctl, which is mode 0660 and owned by the `wheel`
+# group, and runs `rvn --json --yes ...` as root for whoever connects. For a
+# long time that socket's mode was the whole of the access control, and the
+# consequence was this: every process running as a member of wheel -- your web
+# browser, a font renderer inside it, an `npm install` postinstall script, a
+# shell one-liner pasted from a forum -- could install any package from the AUR
+# and get root, with no prompt, no password and no record that it had happened.
+# Not because of a bug. That was the design, and on a single-user desktop where
+# the one human is in wheel it amounts to no privilege boundary at all.
+#
+# This file is the boundary. It says which operations need a human to agree to
+# them, how long that agreement lasts, and what happens when nobody can be
+# asked. The audit log says what was asked for and by what.
+#
+# What this file cannot do is make wheel membership safe. A member of wheel can
+# still run `sudo`, and `sudo` is the same root by a different door. The point
+# of prompting here is not to stop an administrator doing administration; it is
+# that a *background* process running with your credentials cannot silently
+# become root, because it has no way to answer a prompt that appears in front
+# of your eyes.
+
+
+[policy]
+
+# What each class of operation takes before rvnd will run it.
+#
+#   "allow"   run it; record it in the audit log; ask nobody
+#   "auth"    ask the human who owns the session the request came from, and
+#             run it only if they agree
+#   "deny"    refuse it, always, and say that policy refused it
+#
+# The four classes are decided from the request, never from anything the
+# client says about itself:
+#
+#   query   Operations that install nothing and remove nothing. Today that is
+#           `sync`, which downloads the repository databases and verifies them
+#           against the keyring. It writes as root, but only files that are
+#           signed data, never anything that gets executed.
+#
+#           The read-only commands people actually think of as queries --
+#           `rvn list`, `info`, `owns`, `files`, `find` -- never reach this
+#           daemon at all. They read databases that anybody can read, in the
+#           calling process, as the calling user. There is nothing here to
+#           authorize and this setting has no effect on them. It is written
+#           down anyway so that it stays true: an operation that starts
+#           needing the daemon must be classified here deliberately.
+#
+#   repo    Installing, upgrading or removing packages that come from the
+#           configured repositories. The archives are signature-checked
+#           against the machine's keyring before a byte of them is unpacked,
+#           so what runs is what the distribution signed -- but their install
+#           scriptlets still run as root, so this is still root.
+#
+#   aur     Anything that may build a package from the AUR. A PKGBUILD is a
+#           shell script from a stranger; rvn runs it as the unprivileged
+#           `raven-build` account rather than as root, which is a real
+#           boundary, but the package it produces is then unpacked into `/`
+#           and its scriptlets run as root like any other.
+#
+#           An `install` that was not asked for `--repo-only` lands here even
+#           if every package in it turns out to come from a repository, and
+#           that is deliberate: which packages a request resolves to is not
+#           knowable when the request arrives, and a classification that
+#           depended on the answer would be a classification an attacker gets
+#           to influence.
+#
+#   service Starting, stopping, enabling or disabling one of the daemons this
+#           machine already ships a service definition for -- face unlock, the
+#           fingerprint reader, bluetooth, the print spooler. It installs
+#           nothing and builds nothing.
+#
+#           This is here because raven-init's control socket is mode 0600 and
+#           has to stay that way: PID 1 must never hand an unprivileged
+#           session a channel into itself. So until this class existed,
+#           turning the fingerprint reader on meant `sudo raven-rc` in a
+#           terminal, and Raven Settings -- which could see the reader and the
+#           daemon's binary -- could do nothing but print the command. rvnd is
+#           already a root process that checks the caller's group, asks the
+#           human through ravend and writes down what it did; this is those
+#           same four things pointed at a second socket.
+#
+#           What it can reach is fixed and small. A name is refused unless a
+#           root-owned definition of that name is already on disk, either as a
+#           template a signed package shipped under /usr/share/raven/services
+#           or as a drop-in under /etc/raven/init.d. There is no field in the
+#           request that names a program, and nothing a client sends becomes
+#           one -- so the worst this class can do is run a daemon the machine
+#           was already going to run at its next boot.
+#
+#           `"allow"` is a defensible setting for a single-user laptop: it
+#           makes the switches in Settings behave like every other switch in
+#           Settings. The default is `"auth"` because turning face unlock on
+#           changes how the machine can be opened, and the person who should
+#           agree to that is the one sitting in front of it.
+#
+# The interesting policy this split is for is `repo = "allow"` with
+# `aur = "auth"`: take the distribution's signed packages without ceremony,
+# and put a human in front of anything that runs a build script. If unattended
+# upgrades matter more to you than the prompt, that is the line to change --
+# and if you want the prompt everywhere, leave this file alone.
+query = "allow"
+repo = "auth"
+aur = "auth"
+service = "auth"
+
+# How long an answered prompt counts for, in seconds, the way sudo's timestamp
+# does. 0 asks every time.
+#
+# The agreement is remembered against the session it was given in -- the
+# process session the requesting process belongs to, identified by its leader's
+# pid *and* the leader's start time, so that a recycled pid can never inherit
+# somebody else's answer. It is not remembered against the uid: two terminals
+# in the same graphical session share one answer, which is what you want, and a
+# background daemon running as you but in no session of its own shares nothing.
+#
+# Five minutes is sudo's own default and is chosen for the same reason: long
+# enough that installing four packages in a row is one prompt, short enough
+# that walking away from the machine ends it.
+auth_cache_seconds = 300
+
+# What to do when an operation is set to "auth" and there is nothing available
+# to ask.
+#
+#   "allow"   run it, write a warning to the daemon's log, tell the client so
+#             the warning reaches whoever is watching, and record it in the
+#             audit log as an unauthenticated allow
+#   "deny"    refuse it
+#
+# The default is "allow", and it is the uncomfortable default on purpose.
+#
+# rvnd is how this desktop installs anything: Raven Store goes through it, and
+# so does an unprivileged `rvn` in a terminal. The prompt is raised by ravend,
+# the login daemon, in the session that asked -- and on a machine where ravend
+# is not running, or is an older version that does not know how to raise one
+# (see `[auth]` below), "deny" means package management stops working entirely
+# with an error about authentication that most people will read as a bug. A
+# security control whose failure mode is a bricked package manager gets turned
+# off, and then it is not a control.
+#
+# So the shipped default fails towards working, loudly. Every such allow is a
+# WARNING in the daemon's log and a line in the audit log that says
+# `auth=unavailable`, which is exactly the thing to alert on. Turn this to
+# "deny" once you have confirmed that prompts do appear on this machine -- and
+# do confirm it, because an installation where they never worked looks
+# identical in every way except those log lines.
+#
+# Note what is *not* covered by this: a prompt that appeared and was ignored
+# until it timed out is a refusal, not an absence. Something answered the
+# socket, so the mechanism exists and the human declined to use it. Only a
+# prompt that could not be raised at all reaches this setting.
+on_auth_unavailable = "allow"
+
+
+[auth]
+
+# Where to ask. ravend owns the login sessions on this machine, so ravend is
+# the only thing that knows which display a given session is on and can put a
+# window in front of it; it is also what already holds this account's password
+# and fingerprint policy (`sudo = true` in RavenLogin's finger policy is the
+# same permission being asked for here, at a different door).
+#
+# rvnd cannot use ravend's existing verify socket at /run/raven-lock/verify.sock
+# for this. That socket deliberately answers only about the account that owns
+# the connection, resolved from SO_PEERCRED -- and the connection would be
+# rvnd's, so it would be asking about root. What is needed is a socket where a
+# root caller names the session to prompt, which is a different and much more
+# dangerous thing, and is why the path below is expected to be mode 0600 and
+# owned by root: anything that can reach it can raise an authorization prompt
+# for any session on the machine.
+#
+# rvnd speaks the same framing RavenLogin's other sockets use -- a 4-byte
+# big-endian length followed by that many bytes of JSON -- and sends one
+# request naming the uid, the pid, the session, the operation and the packages,
+# then reads one reply. If nothing is listening there, that is the
+# `on_auth_unavailable` case above.
+socket = "/run/raven-login/authorize.sock"
+
+# How long to wait for the human, in seconds. When this expires the request is
+# refused, not allowed: see the note at the end of `on_auth_unavailable`.
+#
+# Two minutes because the prompt may appear on a screen that is asleep, and a
+# `rvn install` in a terminal that fails while you are finding the mouse is a
+# worse outcome than a request that sits for a while.
+timeout_seconds = 120
+
+
+[audit]
+
+# Where every privileged request is recorded: the time, the uid and account
+# name, the gid, the pid, the path that pid was executing according to
+# /proc/<pid>/exe, the session, the operation, the classification, the decision
+# and the package list. Refused requests are recorded exactly like permitted
+# ones, and are the more interesting half of the file.
+#
+# This is the only place that answers "what asked for that?" after the fact.
+# /var/log/pacman.log records what was installed, which is the same information
+# every other package manager keeps and is not the question -- the question is
+# whether it was you or your browser, and the exe path is what answers it.
+#
+# The exe path is recorded and never trusted. By the time rvnd reads it the
+# process may have exec'd something else or exited and had its pid reused, and
+# a path is not an identity in any case: it is a lead for a human reading the
+# log later, not an input to the decision above.
+#
+# A log that cannot be written is a warning on the daemon's own stderr and does
+# not stop the transaction. Losing the ability to install packages because
+# /var is full is a worse failure than losing the record of it, and the
+# warning is the thing to alert on.
+#
+# Note the name. `/var/log/raven/rvnd.log`, which is the obvious choice, is
+# already taken: raven-init captures every service's console output to
+# `<name>.log` in this directory, so that file is where rvnd's own stderr
+# goes. The two are worth keeping apart -- one is a record and the other is
+# chatter, and the chatter includes this daemon complaining that it cannot
+# write the record.
+file = "/var/log/raven/rvnd-audit.log"

@@ -143,6 +143,51 @@ fn apply_sysusers(root: &Path, text: &str, applied: &mut Applied, warn: &mut imp
     }
 }
 
+/// Creates a system account that rvn declares for itself, the way a package's
+/// sysusers.d fragment declares one for its daemon.
+///
+/// Everything else in this module acts on a declaration some *package* shipped.
+/// This entry point exists because rvn has exactly one account of its own to
+/// declare: `raven-build`, the unprivileged user an AUR build drops to. Routing
+/// it through the same code rather than shelling out to `useradd` keeps one
+/// implementation of what a system account looks like on Raven -- a locked
+/// password, `/bin/false` for a shell, a uid from the 100-999 range and a group
+/// of the same name -- and it works on a machine where shadow-utils has not
+/// been installed yet, which is precisely the machine that is about to run its
+/// first build.
+///
+/// Returns whether an account was created. An account that already exists is
+/// left exactly as it is, uid, home and all: an administrator who adjusted it
+/// meant to, and silently rewriting their entry would be the package manager
+/// overruling them about the contents of /etc/passwd.
+pub fn ensure_declared_user(
+    root: &Path,
+    name: &str,
+    gecos: &str,
+    home: &str,
+) -> std::io::Result<bool> {
+    // `-` asks for the next free system id, the same thing a sysusers.d line
+    // that does not pin a uid asks for.
+    ensure_user(root, name, "-", gecos, home)
+}
+
+/// The account name a uid belongs to, or `None` when no entry claims it.
+///
+/// Used to say *whose* files rvn is about to take over, because "this build
+/// tree belongs to jane" is an explanation and "this build tree belongs to
+/// 1000" is a puzzle. It reads the passwd file directly rather than asking
+/// `id`, so it answers for the install root it was given rather than for
+/// whatever the host's name service happens to say.
+pub fn user_name(root: &Path, uid: u32) -> Option<String> {
+    read_db(root, "passwd").lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        // name:password:uid:... -- skip the password placeholder.
+        let found: u32 = fields.nth(1)?.parse().ok()?;
+        (found == uid).then(|| name.to_string())
+    })
+}
+
 /// The passwd/group/shadow files under an install root.
 fn db(root: &Path, name: &str) -> PathBuf {
     root.join("etc").join(name)
@@ -561,5 +606,77 @@ mod tests {
             fields(r#"u dbus 81 "System Message Bus" /"#),
             vec!["u", "dbus", "81", "System Message Bus", "/"]
         );
+    }
+
+    #[test]
+    fn rvns_own_build_account_is_created_like_any_system_account() {
+        let root = root("declared-user");
+        write(&root, "etc/passwd", "root:x:0:0:root:/root:/bin/bash\n");
+        write(&root, "etc/group", "root:x:0:\n");
+
+        let created = ensure_declared_user(
+            &root,
+            "raven-build",
+            "Raven AUR build user",
+            "/var/cache/pacman/pkg/raven-build",
+        )
+        .unwrap();
+        assert!(created);
+
+        let passwd = std::fs::read_to_string(root.join("etc/passwd")).unwrap();
+        // A uid from the system range, the declared home, and no login shell.
+        assert!(
+            passwd.contains("raven-build:x:999:999:Raven AUR build user:/var/cache/pacman/pkg/raven-build:/bin/false"),
+            "{passwd}"
+        );
+        let group = std::fs::read_to_string(root.join("etc/group")).unwrap();
+        assert!(group.contains("raven-build:x:999:"), "{group}");
+        let shadow = std::fs::read_to_string(root.join("etc/shadow")).unwrap();
+        assert!(
+            shadow.starts_with("raven-build:!:"),
+            "the build account can never be logged into: {shadow}"
+        );
+    }
+
+    #[test]
+    fn an_existing_build_account_is_left_alone() {
+        let root = root("declared-user-existing");
+        // An administrator pinned the uid and moved the home somewhere else.
+        write(
+            &root,
+            "etc/passwd",
+            "root:x:0:0:root:/root:/bin/bash\nraven-build:x:412:412:builds:/srv/build:/bin/false\n",
+        );
+        write(&root, "etc/group", "root:x:0:\nraven-build:x:412:\n");
+
+        let created =
+            ensure_declared_user(&root, "raven-build", "Raven AUR build user", "/var/cache")
+                .unwrap();
+
+        assert!(!created);
+        let passwd = std::fs::read_to_string(root.join("etc/passwd")).unwrap();
+        assert!(
+            passwd.contains("raven-build:x:412:412:builds:/srv/build:"),
+            "{passwd}"
+        );
+        assert_eq!(
+            passwd.matches("raven-build").count(),
+            1,
+            "no second entry: {passwd}"
+        );
+    }
+
+    #[test]
+    fn a_uid_is_named_from_the_roots_own_passwd() {
+        let root = root("user-name");
+        write(
+            &root,
+            "etc/passwd",
+            "root:x:0:0:root:/root:/bin/bash\njane:x:1000:1000:Jane:/home/jane:/bin/bash\n",
+        );
+
+        assert_eq!(user_name(&root, 1000).as_deref(), Some("jane"));
+        assert_eq!(user_name(&root, 0).as_deref(), Some("root"));
+        assert_eq!(user_name(&root, 4242), None);
     }
 }

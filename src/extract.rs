@@ -32,6 +32,17 @@ pub enum ExtractError {
         path: String,
         owner: String,
     },
+    /// Two packages in the *same* transaction ship the same path. Neither is
+    /// in the local database yet, so the owner check above cannot see it: the
+    /// only record of the first package's claim is the one the caller builds
+    /// as it walks the batch. Left undetected, both extracted, the second
+    /// silently overwrote the first, and the database named two owners for
+    /// one file -- after which removing either one took the file with it.
+    BatchConflict {
+        path: String,
+        /// The package earlier in this batch that claimed the path first.
+        other: String,
+    },
     UnsupportedFormat(String),
     /// A hard link could not be recreated, with the entry that caused it.
     LinkFailed {
@@ -68,6 +79,9 @@ impl std::fmt::Display for ExtractError {
             ExtractError::UnsafePath(p) => write!(f, "archive contains unsafe path: {p}"),
             ExtractError::FileConflict { path, owner } => {
                 write!(f, "{path} is already owned by {owner}")
+            }
+            ExtractError::BatchConflict { path, other } => {
+                write!(f, "{path} is also shipped by {other} in this transaction")
             }
             ExtractError::UnsupportedFormat(e) => write!(f, "unsupported package format: {e}"),
             ExtractError::LinkFailed {
@@ -849,14 +863,33 @@ fn extract_entries(
                     continue;
                 }
 
-                let existed = std::fs::symlink_metadata(&destination).is_ok();
+                // Configuration on disk wins whatever type the new version
+                // ships the path as. Upstream moving a default into
+                // /usr/share and leaving a compatibility symlink at the old
+                // /etc path is an ordinary migration, and before this the
+                // link simply replaced the administrator's file: unlinked,
+                // with no `.pacnew`, nothing in `pacnew` for the summary to
+                // report, and the BACKUP record then hashing a symlink that
+                // resolves to the package's own default -- so a later
+                // uninstall would have deleted it too as untouched package
+                // content. The regular-file branch below has always spared
+                // these paths; this one did not.
+                let spare = backup.contains(as_string.as_str())
+                    && std::fs::symlink_metadata(&destination).is_ok();
+                let (link_path, link_name) = if spare {
+                    (pacnew_path(&destination), format!("{as_string}.pacnew"))
+                } else {
+                    (destination.clone(), as_string.clone())
+                };
+
+                let existed = std::fs::symlink_metadata(&link_path).is_ok();
                 // An empty directory has nothing to lose, so it gives way to
                 // the link -- which is exactly what `find_conflicts` promised
                 // by refusing only a populated one. `remove_file` cannot take
                 // a directory, so this needs its own call.
-                let replaced_empty_dir = std::fs::remove_dir(&destination).is_ok();
-                let _ = std::fs::remove_file(&destination);
-                if let Err(err) = std::os::unix::fs::symlink(&target, &destination) {
+                let replaced_empty_dir = std::fs::remove_dir(&link_path).is_ok();
+                let _ = std::fs::remove_file(&link_path);
+                if let Err(err) = std::os::unix::fs::symlink(&target, &link_path) {
                     // `remove_file` cannot take a directory, so a package
                     // symlink aimed at an existing real directory lands here.
                     // Arch's `filesystem` package does exactly this: it ships
@@ -870,32 +903,63 @@ fn extract_entries(
                     // refused in both places rather than being skipped in one
                     // and rejected in the other.
                     let existing_dir = err.kind() == std::io::ErrorKind::AlreadyExists
-                        && std::fs::symlink_metadata(&destination)
+                        && std::fs::symlink_metadata(&link_path)
                             .is_ok_and(|meta| meta.is_dir());
                     if existing_dir {
                         return Err(ExtractError::TypeConflict {
-                            path: as_string.clone(),
+                            path: link_name.clone(),
                             wanted: format!("a symlink to {}", target.display()),
-                            found: describe_existing(&destination)
+                            found: describe_existing(&link_path)
                                 .unwrap_or_else(|| "a directory".into()),
                         });
                     }
                     return Err(ExtractError::LinkFailed {
-                        path: relative.to_string_lossy().to_string(),
+                        path: link_name.clone(),
                         target: target.to_string_lossy().to_string(),
                         reason: err.to_string(),
                     });
                 }
+                if spare {
+                    // Same rule the regular-file branch applies: when the two
+                    // resolve to identical bytes there is nothing for the
+                    // administrator to reconcile, so ownership transfers
+                    // quietly and no `.pacnew` is left behind. A link whose
+                    // target has not been extracted yet cannot be compared,
+                    // and an unreadable side counts as different -- a spare
+                    // `.pacnew` costs a line in the summary, the other way
+                    // round costs the edits.
+                    if same_bytes(&destination, &link_path) {
+                        let _ = std::fs::remove_file(&link_path);
+                    } else {
+                        created.push(Created {
+                            absolute: link_path.clone(),
+                            relative: link_name.clone(),
+                            is_dir: false,
+                            replaced_empty_dir: false,
+                        });
+                        pacnew.push(as_string.clone());
+                        deferred_times.push((
+                            link_path.clone(),
+                            entry.header().mtime().unwrap_or(0),
+                            false,
+                        ));
+                    }
+                    // The package owns the path either way; only the bytes on
+                    // disk were spared.
+                    on_file(&as_string);
+                    installed.push(as_string);
+                    continue;
+                }
                 if !existed || replaced_empty_dir {
                     created.push(Created {
-                        absolute: destination.clone(),
-                        relative: as_string.clone(),
+                        absolute: link_path.clone(),
+                        relative: link_name.clone(),
                         is_dir: false,
                         replaced_empty_dir,
                     });
                 }
                 deferred_times.push((
-                    destination.clone(),
+                    link_path.clone(),
                     entry.header().mtime().unwrap_or(0),
                     false,
                 ));
@@ -934,13 +998,7 @@ fn extract_entries(
                 // left out, so an untouched config file still follows the
                 // package across upgrades.
                 if backup.contains(as_string.as_str()) {
-                    let pacnew_path = destination.with_file_name(format!(
-                        "{}.pacnew",
-                        destination
-                            .file_name()
-                            .map(|n| n.to_string_lossy())
-                            .unwrap_or_default()
-                    ));
+                    let pacnew_path = pacnew_path(&destination);
                     let _ = std::fs::remove_file(&pacnew_path);
                     entry
                         .unpack(&pacnew_path)
@@ -1003,24 +1061,53 @@ fn extract_entries(
             continue;
         }
 
-        let existed = std::fs::symlink_metadata(&destination).is_ok();
-        let _ = std::fs::remove_file(&destination);
+        // The same rule the other two branches follow: a path the caller
+        // listed as `backup` is the administrator's, and a package shipping
+        // it as a hard link this time round does not change that. Rare, but
+        // the cost of getting it wrong is the same edits.
+        let spare = backup.contains(as_string.as_str())
+            && std::fs::symlink_metadata(&destination).is_ok();
+        let (link_path, link_name) = if spare {
+            (pacnew_path(&destination), format!("{as_string}.pacnew"))
+        } else {
+            (destination.clone(), as_string.clone())
+        };
 
-        if let Err(e) = std::fs::hard_link(&source, &destination) {
+        let existed = std::fs::symlink_metadata(&link_path).is_ok();
+        let _ = std::fs::remove_file(&link_path);
+
+        if let Err(e) = std::fs::hard_link(&source, &link_path) {
             // Some filesystems refuse cross-device or case-colliding links.
             // A copy preserves the package's contents, which matters more
             // than the inode being shared.
-            std::fs::copy(&source, &destination).map_err(|_| ExtractError::LinkFailed {
-                path: link.display().to_string(),
+            std::fs::copy(&source, &link_path).map_err(|_| ExtractError::LinkFailed {
+                path: link_name.clone(),
                 target: target.display().to_string(),
                 reason: e.to_string(),
             })?;
         }
 
+        if spare {
+            if same_bytes(&destination, &link_path) {
+                let _ = std::fs::remove_file(&link_path);
+            } else {
+                created.push(Created {
+                    absolute: link_path,
+                    relative: link_name,
+                    is_dir: false,
+                    replaced_empty_dir: false,
+                });
+                pacnew.push(as_string.clone());
+            }
+            on_file(&as_string);
+            installed.push(as_string);
+            continue;
+        }
+
         if !existed {
             created.push(Created {
-                absolute: destination,
-                relative: as_string.clone(),
+                absolute: link_path,
+                relative: link_name,
                 is_dir: false,
                 replaced_empty_dir: false,
             });
@@ -1033,6 +1120,25 @@ fn extract_entries(
     apply_timestamps(deferred_times);
 
     Ok(installed)
+}
+
+/// Where a package's copy goes when the file on disk is spared: the path with
+/// `.pacnew` appended to the whole name, so `etc/foo.conf` becomes
+/// `etc/foo.conf.pacnew` -- the spelling `rvn config` and `was_modified` both
+/// look for.
+///
+/// One function because three branches of the extractor need it now. It used
+/// to be written out only in the regular-file branch, which is precisely why
+/// the link branches did not spare anything: there was no `.pacnew` to write
+/// the package's copy to, so they overwrote the live path instead.
+fn pacnew_path(destination: &Path) -> PathBuf {
+    destination.with_file_name(format!(
+        "{}.pacnew",
+        destination
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default()
+    ))
 }
 
 /// Restores mtimes on symlinks and directories.
@@ -2197,4 +2303,156 @@ mod tests {
         );
     }
 
+    /// Upstream moving a default out of /etc and leaving a compatibility
+    /// symlink behind is a routine release, and the administrator's edits
+    /// must survive it exactly as they survive a plain file being reshipped.
+    ///
+    /// The backup set used to be consulted only in the regular-file branch,
+    /// so an entry whose header said Symlink went straight to `remove_file`
+    /// on the live path: the edits were gone, `pacnew` stayed empty so the
+    /// summary said nothing, and the BACKUP record was then written from a
+    /// link resolving to the package's own default -- which would have made a
+    /// later uninstall delete it too, as untouched package content.
+    #[test]
+    fn a_protected_config_shipped_as_a_symlink_is_spared() {
+        let mut builder = tar::Builder::new(Vec::new());
+        // The package's new default, and the link that replaces the old path.
+        let mut header = tar::Header::new_gnu();
+        header.set_size(16);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/share/foo/foo.conf", &b"shipped default\n"[..])
+            .unwrap();
+        link_entry(
+            &mut builder,
+            "etc/foo.conf",
+            "../usr/share/foo/foo.conf",
+            tar::EntryType::Symlink,
+        );
+        let archive = write_tar("backup-symlink", &builder.into_inner().unwrap());
+        let root = temp_dir("backup-symlink");
+
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/foo.conf"), b"mine = 1\n").unwrap();
+
+        let mut pacnew = Vec::new();
+        let files = unpack(
+            &archive,
+            &root,
+            &unowned(),
+            &["etc/foo.conf".to_string()],
+            &mut pacnew,
+            |_| {},
+        )
+        .unwrap();
+
+        // The administrator's file is untouched and still a regular file.
+        let meta = std::fs::symlink_metadata(root.join("etc/foo.conf")).unwrap();
+        assert!(meta.file_type().is_file(), "the edited config was replaced");
+        assert_eq!(
+            std::fs::read_to_string(root.join("etc/foo.conf")).unwrap(),
+            "mine = 1\n"
+        );
+
+        // The package's link landed beside it, and the summary knows about it.
+        assert_eq!(
+            std::fs::read_link(root.join("etc/foo.conf.pacnew")).unwrap(),
+            PathBuf::from("../usr/share/foo/foo.conf")
+        );
+        assert_eq!(pacnew, vec!["etc/foo.conf".to_string()]);
+        // The package owns the path either way.
+        assert!(files.contains(&"etc/foo.conf".to_string()));
+    }
+
+    /// The other half of the rule, and the reason the check cannot simply be
+    /// "is it in the backup set": when the link resolves to the same bytes the
+    /// disk already holds there is nothing to reconcile, so ownership
+    /// transfers quietly rather than leaving a `.pacnew` nobody needs.
+    #[test]
+    fn an_identical_config_shipped_as_a_symlink_leaves_no_pacnew() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(16);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/share/foo/foo.conf", &b"shipped default\n"[..])
+            .unwrap();
+        link_entry(
+            &mut builder,
+            "etc/foo.conf",
+            "../usr/share/foo/foo.conf",
+            tar::EntryType::Symlink,
+        );
+        let archive = write_tar("backup-symlink-same", &builder.into_inner().unwrap());
+        let root = temp_dir("backup-symlink-same");
+
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/foo.conf"), b"shipped default\n").unwrap();
+
+        let mut pacnew = Vec::new();
+        unpack(
+            &archive,
+            &root,
+            &unowned(),
+            &["etc/foo.conf".to_string()],
+            &mut pacnew,
+            |_| {},
+        )
+        .unwrap();
+
+        assert!(pacnew.is_empty());
+        assert!(!root.join("etc/foo.conf.pacnew").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("etc/foo.conf")).unwrap(),
+            "shipped default\n"
+        );
+    }
+
+    /// Same rule again for the hard-link branch, which runs in the second
+    /// pass and had the same blind spot.
+    #[test]
+    fn a_protected_config_shipped_as_a_hard_link_is_spared() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(16);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/share/foo/foo.conf", &b"shipped default\n"[..])
+            .unwrap();
+        link_entry(
+            &mut builder,
+            "etc/foo.conf",
+            "usr/share/foo/foo.conf",
+            tar::EntryType::Link,
+        );
+        let archive = write_tar("backup-hardlink", &builder.into_inner().unwrap());
+        let root = temp_dir("backup-hardlink");
+
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc/foo.conf"), b"mine = 1\n").unwrap();
+
+        let mut pacnew = Vec::new();
+        unpack(
+            &archive,
+            &root,
+            &unowned(),
+            &["etc/foo.conf".to_string()],
+            &mut pacnew,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("etc/foo.conf")).unwrap(),
+            "mine = 1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("etc/foo.conf.pacnew")).unwrap(),
+            "shipped default\n"
+        );
+        assert_eq!(pacnew, vec!["etc/foo.conf".to_string()]);
+    }
 }

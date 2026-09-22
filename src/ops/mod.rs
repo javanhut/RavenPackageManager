@@ -1,8 +1,12 @@
 //! High-level operations, each owning one user-facing command.
 
+pub mod build;
+pub mod cache;
+pub mod config;
 pub mod install;
 pub mod query;
 pub mod remove;
+pub mod rollback;
 pub mod search;
 pub mod sync;
 pub mod update;

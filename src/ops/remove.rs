@@ -1,7 +1,12 @@
 //! `rvn uninstall`: removing installed packages.
 
 use super::Context;
+// The removal line wears pacman.log's timestamp, which is `audit`'s to
+// compute -- see the note on `audit::timestamp` for why one module owns the
+// calendar.
+use crate::audit::{now_unix, timestamp};
 use crate::remove::{self, Options, RemovalPlan};
+use crate::txhooks;
 use crate::ui::theme::{Color, bytes};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -151,7 +156,38 @@ pub fn execute(
         return Err("cancelled".into());
     }
 
-    apply(ctx, &plan)
+    // ---- transaction hooks ---------------------------------------------
+    //
+    // Both sides are driven from here rather than from `apply`, because
+    // `apply` is also how an install retires a package something replaced —
+    // and that is one install transaction, not an install with a removal
+    // nested inside it. A snapshot hook firing twice in the middle of an
+    // upgrade is exactly the confusion that would cause.
+    //
+    // The file list is taken now, before anything is deleted: it is read out
+    // of the very records `apply` is about to unregister, and it is the same
+    // list for both moments because what a removal did is what it was going
+    // to do. `apply` either removes every package in the plan or returns an
+    // error, so the planned set is also the removed set.
+    let hooks = super::install::load_transaction_hooks(ctx)?;
+    let targets: Vec<String> = plan.remove.iter().map(|p| p.name.clone()).collect();
+    let files = if hooks.wants_paths(txhooks::When::Pre) || hooks.wants_paths(txhooks::When::Post) {
+        targets
+            .iter()
+            .filter_map(|name| ctx.local.files_or_empty(name).ok())
+            .flatten()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let transaction = txhooks::Transaction::new(vec![txhooks::Operation::Remove], targets, files);
+    super::install::run_transaction_hooks(ctx, &hooks, txhooks::When::Pre, &transaction)?;
+
+    let outcome = apply(ctx, &plan)?;
+
+    super::install::run_transaction_hooks(ctx, &hooks, txhooks::When::Post, &transaction)?;
+
+    Ok(outcome)
 }
 
 /// Deletes the files of an already-approved plan and updates the database.
@@ -202,23 +238,8 @@ pub fn apply(ctx: &mut Context, plan: &RemovalPlan) -> Result<Outcome, String> {
 
             let path = ctx.config.root_dir.join(file);
 
-            if pkg.is_backup(file) && path.exists() && was_modified(pkg, file, &path) {
-                // An edited configuration file is never destroyed; it is set
-                // aside so an administrator can recover or discard it. One
-                // still matching what was installed is just package content.
-                let saved = path.with_extension(format!(
-                    "{}pacsave",
-                    path.extension()
-                        .and_then(|e| e.to_str())
-                        .map(|e| format!("{e}."))
-                        .unwrap_or_default()
-                ));
-                if std::fs::rename(&path, &saved).is_ok() {
-                    preserved.push(file.clone());
-                }
-            } else {
-                // A file already gone is not an error — the goal is its absence.
-                let _ = std::fs::remove_file(&path);
+            if retire_file(pkg, file, &path) == Retirement::Preserved {
+                preserved.push(file.clone());
             }
 
             if let Some(parent) = path.parent() {
@@ -300,6 +321,66 @@ pub fn apply(ctx: &mut Context, plan: &RemovalPlan) -> Result<Outcome, String> {
     Ok(Outcome { removed, preserved })
 }
 
+/// What became of a file a package owned and no longer should.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Retirement {
+    /// Unlinked: it was package content, and package content goes with the
+    /// package.
+    Deleted,
+    /// Renamed to `.pacsave`: an edited configuration file, which is the
+    /// administrator's work and not the package's.
+    Preserved,
+    /// Neither happened. The file was already gone, or the rename failed and
+    /// leaving it where the administrator put it beats deleting it.
+    Left,
+}
+
+/// Retires one file a package owned, preserving an edited configuration file
+/// as `.pacsave` and unlinking anything else.
+///
+/// Two callers have to make this decision: the uninstall loop above, and
+/// `install::prune_stale`, which deletes the paths the previous version owned
+/// and the new one no longer ships. Both are the same situation — a file is
+/// about to stop being owned — and an edit the administrator made is just as
+/// lost either way, so the policy lives here once. `prune_stale` used to
+/// unlink unconditionally, which is how a config file that a new upstream
+/// version merely *relocated* took the administrator's edits with it.
+pub(crate) fn retire_file(
+    pkg: &crate::pkg::Package,
+    file: &str,
+    path: &Path,
+) -> Retirement {
+    if pkg.is_backup(file) && path.exists() && was_modified(pkg, file, path) {
+        // An edited configuration file is never destroyed; it is set aside so
+        // an administrator can recover or discard it. One still matching what
+        // was installed is just package content.
+        if std::fs::rename(path, pacsave_path(path)).is_ok() {
+            return Retirement::Preserved;
+        }
+        // The rename failed, so the edited file is still exactly where it was.
+        // Unlinking it now would be the loss this branch exists to prevent.
+        return Retirement::Left;
+    }
+    // A file already gone is not an error — the goal is its absence.
+    match std::fs::remove_file(path) {
+        Ok(()) => Retirement::Deleted,
+        Err(_) => Retirement::Left,
+    }
+}
+
+/// Where a preserved configuration file goes: the path with `.pacsave`
+/// appended after whatever extension it already had, so `foo.conf` becomes
+/// `foo.conf.pacsave` and a plain `sudo` becomes `sudo.pacsave`.
+pub(crate) fn pacsave_path(path: &Path) -> PathBuf {
+    path.with_extension(format!(
+        "{}pacsave",
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!("{e}."))
+            .unwrap_or_default()
+    ))
+}
+
 /// Whether a backup file differs from what the package installed.
 ///
 /// Without a recorded checksum the file cannot be proven untouched, so it is
@@ -344,35 +425,6 @@ fn log_removed(log: &Path, name: &str, version: &str, when: u64) -> std::io::Res
         file,
         "[{}] [RVN] removed {name} ({version})",
         timestamp(when)
-    )
-}
-
-/// Seconds since the epoch, or 0 if the clock is before it.
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Seconds since the epoch as pacman.log's `YYYY-MM-DDTHH:MM:SS+0000`, in UTC.
-fn timestamp(secs: u64) -> String {
-    // Civil date from a day count: Howard Hinnant's civil_from_days.
-    let z = (secs / 86_400) as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    let rem = secs % 86_400;
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}+0000",
-        rem / 3600,
-        rem / 60 % 60,
-        rem % 60
     )
 }
 
@@ -496,14 +548,6 @@ mod tests {
 
         std::fs::write(dir.join("sudo.pacnew"), b"arch's stack").unwrap();
         assert!(was_modified(&pkg, "etc/pam.d/sudo", &path));
-    }
-
-    #[test]
-    fn timestamps_match_pacman_log() {
-        assert_eq!(timestamp(0), "1970-01-01T00:00:00+0000");
-        // A leap day, which is where a hand-rolled calendar goes wrong.
-        assert_eq!(timestamp(951_782_400), "2000-02-29T00:00:00+0000");
-        assert_eq!(timestamp(1_789_504_157), "2026-09-15T20:29:17+0000");
     }
 
     #[test]
