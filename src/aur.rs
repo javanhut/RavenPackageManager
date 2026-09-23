@@ -128,6 +128,8 @@ pub fn parse_rpc(body: &str) -> Result<Vec<Package>, String> {
 /// same package repeatedly.
 pub struct Aur {
     cache: Mutex<HashMap<String, Option<Package>>>,
+    /// Providers already looked up, keyed by the dependency as written.
+    providers: Mutex<HashMap<String, Option<Package>>>,
     offline: bool,
 }
 
@@ -135,6 +137,7 @@ impl Aur {
     pub fn new() -> Aur {
         Aur {
             cache: Mutex::new(HashMap::new()),
+            providers: Mutex::new(HashMap::new()),
             offline: false,
         }
     }
@@ -143,6 +146,7 @@ impl Aur {
     pub fn offline() -> Aur {
         Aur {
             cache: Mutex::new(HashMap::new()),
+            providers: Mutex::new(HashMap::new()),
             offline: true,
         }
     }
@@ -203,6 +207,21 @@ impl Aur {
         Ok(packages)
     }
 
+    /// Every AUR package that says it provides `name`, with full metadata.
+    ///
+    /// The search endpoint answers with names and versions only -- no
+    /// `Provides`, no `Depends` -- so the hits are looked up again with
+    /// `info`, which also warms the cache for the build that follows.
+    pub fn providers_of(&self, name: &str) -> Result<Vec<Package>, String> {
+        if self.offline {
+            return Ok(Vec::new());
+        }
+        let url = format!("{RPC_BASE}/search/{}?by=provides", encode(name));
+        let body = fetch::get_string(&url).map_err(|e| e.to_string())?;
+        let names: Vec<String> = parse_rpc(&body)?.into_iter().map(|p| p.name).collect();
+        self.info(&names)
+    }
+
     /// The git URL for a package's build files.
     pub fn git_url(name: &str) -> String {
         format!("{GIT_BASE}/{name}.git")
@@ -234,6 +253,44 @@ impl Source for Aur {
         }
         found
     }
+
+    /// A package that satisfies `dep` under another name. displaylink needs
+    /// `evdi<1.16`, and no AUR package is called evdi: `evdi-dkms` provides
+    /// it. Asking only by name reported evdi as missing and stopped there.
+    fn provider(&self, dep: &Dep) -> Option<Package> {
+        if self.offline {
+            return None;
+        }
+        let key = dep.to_string();
+        if let Some(hit) = self.providers.lock().ok().and_then(|c| c.get(&key).cloned()) {
+            return hit;
+        }
+        let found = self
+            .providers_of(&dep.name)
+            .ok()
+            .and_then(|candidates| pick_provider(candidates, dep));
+        if let Ok(mut cache) = self.providers.lock() {
+            cache.insert(key, found.clone());
+        }
+        found
+    }
+}
+
+/// Chooses among the AUR packages that claim to provide `dep`.
+///
+/// A release build over a `-git` one, since that is what someone who asked
+/// for the dependency by its plain name most likely means; one that is not
+/// flagged out of date over one that is; then whatever more people use.
+fn pick_provider(candidates: Vec<Package>, dep: &Dep) -> Option<Package> {
+    candidates
+        .into_iter()
+        .filter(|p| p.satisfies(dep))
+        .min_by(|a, b| {
+            let rank = |p: &Package| (crate::devel::is_devel(&p.name), p.out_of_date);
+            rank(a)
+                .cmp(&rank(b))
+                .then(b.popularity.total_cmp(&a.popularity))
+        })
 }
 
 /// A parsed `.SRCINFO`, which is the authoritative dependency list for a
@@ -373,6 +430,36 @@ mod tests {
         // Absent optional fields must default rather than fail the parse.
         assert_eq!(pkgs[1].description, "An open source Spotify client daemon");
         assert!(pkgs[1].url.is_none());
+    }
+
+    fn provider(name: &str, provides: &str, popularity: f64) -> Package {
+        Package {
+            name: name.into(),
+            version: "1".into(),
+            provides: vec![Dep::parse(provides)],
+            popularity,
+            origin: Origin::Aur,
+            ..Default::default()
+        }
+    }
+
+    /// displaylink's `evdi<1.16`: satisfied only through what evdi-dkms
+    /// provides, and the release build wins over the more popular -git one.
+    #[test]
+    fn a_provider_is_chosen_by_what_it_provides() {
+        let candidates = vec![
+            provider("evdi-dkms-git", "evdi=1.14.15", 0.07),
+            provider("evdi-dkms", "evdi=1.15.1", 0.05),
+            provider("evdi-too-new", "evdi=1.16.0", 9.0),
+        ];
+        let picked = pick_provider(candidates, &Dep::parse("evdi<1.16")).unwrap();
+        assert_eq!(picked.name, "evdi-dkms");
+    }
+
+    #[test]
+    fn no_provider_satisfying_the_version_is_none() {
+        let candidates = vec![provider("evdi-too-new", "evdi=1.16.0", 9.0)];
+        assert!(pick_provider(candidates, &Dep::parse("evdi<1.16")).is_none());
     }
 
     #[test]

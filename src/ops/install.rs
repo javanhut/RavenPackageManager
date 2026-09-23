@@ -97,11 +97,15 @@ struct Batch {
     /// administrator who has to go and find one needs its name, not a count.
     stale_preserved: Vec<String>,
     pacnew: Vec<Pacnew>,
+    /// Packages left out because of a file conflict, their own or one they
+    /// depend on. The rest of the batch still went in.
+    held_back: Vec<String>,
 }
 
 impl Batch {
     fn absorb(&mut self, other: Batch) {
         self.installed.extend(other.installed);
+        self.held_back.extend(other.held_back);
         self.stale_removed += other.stale_removed;
         self.stale_preserved.extend(other.stale_preserved);
         self.pacnew.extend(other.pacnew);
@@ -359,6 +363,16 @@ pub fn execute(ctx: &mut Context, targets: &[String]) -> Result<Outcome, String>
     // depends on another AUR package finds it already present.
     for resolved in &aur_targets {
         let pkg = &resolved.package;
+        // Built against the version installed rather than the one it was
+        // resolved against, it would be broken the moment it landed.
+        if let Some(held) = batch.held_back.iter().find(|h| needs(pkg, h, &plan)) {
+            ctx.ui.warn(&format!(
+                "{} needs {held}, which was held back, so it is not built",
+                pkg.name
+            ));
+            batch.held_back.push(pkg.name.clone());
+            continue;
+        }
         ctx.ui.blank();
         let spinner = ctx.ui.stage(&format!("building {} (aur)", pkg.name));
 
@@ -513,6 +527,13 @@ pub fn execute(ctx: &mut Context, targets: &[String]) -> Result<Outcome, String>
             "packages are"
         }
     ));
+
+    if !batch.held_back.is_empty() {
+        ctx.ui.warn(&format!(
+            "held back by file conflicts: {}",
+            batch.held_back.join(", ")
+        ));
+    }
 
     // A .pacnew is the one thing a transaction leaves unfinished for a human,
     // and until now it was announced from inside the install loop -- where the
@@ -1298,6 +1319,72 @@ fn claim_paths(
     conflicts
 }
 
+/// Whether `package` depends on `other`, by name or through something
+/// `other` provides.
+fn needs(package: &Package, other: &str, plan: &Plan) -> bool {
+    let provided: Vec<&str> = plan
+        .install
+        .iter()
+        .find(|r| r.package.name == other)
+        .map(|r| r.package.provides.iter().map(|p| p.name.as_str()).collect())
+        .unwrap_or_default();
+    package
+        .depends
+        .iter()
+        .any(|d| d.name == other || provided.contains(&d.name.as_str()))
+}
+
+/// The lines explaining one package's file conflicts, with advice on the
+/// kinds that have some.
+fn conflict_report(conflicts: &[extract::ExtractError]) -> Vec<String> {
+    let mut lines: Vec<String> = conflicts.iter().map(|c| c.to_string()).collect();
+    // A type conflict on the layout paths is not a packaging mistake,
+    // it is a root that was never usr-merged: Arch ships /bin, /lib,
+    // /lib64 and /sbin as symlinks into /usr, and a split-usr root has
+    // them as real directories. Saying so beats leaving the reader to
+    // work out what to do with "bin would be a symlink to usr/bin".
+    // Anywhere else it is a directory in the package's way -- blaming
+    // usrmerge for firmware directories sent the reader the wrong way.
+    const LAYOUT: &[&str] = &["bin", "lib", "lib64", "sbin", "usr/lib64", "usr/sbin"];
+    let (layout, elsewhere): (Vec<_>, Vec<_>) = conflicts
+        .iter()
+        .filter_map(|c| match c {
+            extract::ExtractError::TypeConflict { path, .. } => Some(path.trim_end_matches('/')),
+            _ => None,
+        })
+        .partition(|path| LAYOUT.contains(path));
+    if !layout.is_empty() {
+        lines.push(
+            "this root is not usr-merged; convert it with \
+             scripts/usrmerge-rootfs.sh, then retry"
+                .to_string(),
+        );
+    }
+    if !elsewhere.is_empty() {
+        lines.push(
+            "if no installed package owns what is in the way, \
+             move it aside, then retry"
+                .to_string(),
+        );
+    }
+    // A collision inside the batch is a packaging mistake in the
+    // packages themselves -- most often a split PKGBUILD whose
+    // package_*() functions both install the same file -- so the
+    // advice above, which is about the state of the root, would send
+    // the reader nowhere.
+    if conflicts
+        .iter()
+        .any(|c| matches!(c, extract::ExtractError::BatchConflict { .. }))
+    {
+        lines.push(
+            "two packages in this transaction ship the same file; \
+             only one of them can own it"
+                .to_string(),
+        );
+    }
+    lines
+}
+
 /// Checks a batch of archives for file conflicts, unpacks them, and records
 /// them in the local database.
 ///
@@ -1312,14 +1399,42 @@ fn install_archives(
     validations: &HashMap<String, crate::pkg::Validation>,
 ) -> Result<Batch, String> {
     let spinner = ctx.ui.stage("checking for file conflicts");
+
+    // Every manifest first, so the check below knows what each upgrade in
+    // this batch will still ship once it lands.
     let mut manifests = Vec::new();
+    for (name, path) in archives {
+        let manifest = extract::manifest(path).map_err(|e| format!("{name}: {e}"))?;
+        manifests.push((name.clone(), path.clone(), manifest));
+    }
+
+    // What each installed package upgraded in this batch will own afterwards.
+    // A file its old version owned and its new version drops is being handed
+    // over, not fought over: pipewire 1.4 moving its modules into
+    // libpipewire read as seventy conflicts, and one upgrade with a file that
+    // changed hands stopped every other update in the run. pacman lets the
+    // same move through for the same reason.
+    let shipping: HashMap<&str, HashSet<&str>> = manifests
+        .iter()
+        .filter(|(name, _, _)| ctx.local.get(name).is_some())
+        .map(|(name, _, m)| {
+            (
+                name.as_str(),
+                m.files.iter().map(String::as_str).collect::<HashSet<_>>(),
+            )
+        })
+        .collect();
+
     // Every path an archive already checked in this batch has claimed, and
     // which one claimed it. `find_conflicts` can only consult the local
     // database, and nothing in this transaction is registered there yet.
     let mut claimed: HashMap<String, String> = HashMap::new();
+    // Per package: the conflicts that stop it, and the packages it is taking
+    // files from -- whose upgrade therefore has to happen too.
+    let mut conflicts_of: HashMap<String, Vec<extract::ExtractError>> = HashMap::new();
+    let mut donors_of: HashMap<String, HashSet<String>> = HashMap::new();
 
-    for (name, path) in archives {
-        let manifest = extract::manifest(path).map_err(|e| format!("{name}: {e}"))?;
+    for (name, _, manifest) in &manifests {
         // Files owned by the version being upgraded are not in the way, and
         // neither are files owned by a package this one replaces: those are
         // handed over, and their old owner is retired once this one is in.
@@ -1331,8 +1446,21 @@ fn install_archives(
                 .map(|(_, old)| old.as_str()),
         );
         let mut conflicts =
-            extract::find_conflicts(&manifest, &ctx.local, &ctx.config.root_dir, &exempt)
+            extract::find_conflicts(manifest, &ctx.local, &ctx.config.root_dir, &exempt)
                 .map_err(|e| format!("{name}: could not check for file conflicts: {e}"))?;
+        let donors = donors_of.entry(name.clone()).or_default();
+        conflicts.retain(|c| match c {
+            extract::ExtractError::FileConflict { path, owner }
+                if owner != name
+                    && shipping
+                        .get(owner.as_str())
+                        .is_some_and(|files| !files.contains(path.as_str())) =>
+            {
+                donors.insert(owner.clone());
+                false
+            }
+            _ => true,
+        });
         // The half the database cannot answer: `rvn install a b`, where both
         // ship the same path and neither is installed. Checked here rather
         // than inside `find_conflicts` because the claims are the caller's
@@ -1340,70 +1468,104 @@ fn install_archives(
         // between them.
         conflicts.extend(claim_paths(&mut claimed, name, &manifest.files));
         if !conflicts.is_empty() {
-            spinner.fail("file conflicts detected");
-            let mut lines: Vec<String> = conflicts.iter().map(|c| c.to_string()).collect();
-            // A type conflict on the layout paths is not a packaging mistake,
-            // it is a root that was never usr-merged: Arch ships /bin, /lib,
-            // /lib64 and /sbin as symlinks into /usr, and a split-usr root has
-            // them as real directories. Saying so beats leaving the reader to
-            // work out what to do with "bin would be a symlink to usr/bin".
-            // Anywhere else it is a directory in the package's way -- blaming
-            // usrmerge for firmware directories sent the reader the wrong way.
-            const LAYOUT: &[&str] = &["bin", "lib", "lib64", "sbin", "usr/lib64", "usr/sbin"];
-            let (layout, elsewhere): (Vec<_>, Vec<_>) = conflicts
-                .iter()
-                .filter_map(|c| match c {
-                    extract::ExtractError::TypeConflict { path, .. } => {
-                        Some(path.trim_end_matches('/'))
-                    }
-                    _ => None,
-                })
-                .partition(|path| LAYOUT.contains(path));
-            if !layout.is_empty() {
-                lines.push(
-                    "this root is not usr-merged; convert it with \
-                     scripts/usrmerge-rootfs.sh, then retry"
-                        .to_string(),
-                );
+            conflicts_of.insert(name.clone(), conflicts);
+        }
+    }
+
+    // One package's conflict holds back that package, not the whole batch --
+    // plus whatever cannot go without it: a package in this batch that
+    // depends on it (the new pipewire pins the new libpipewire), and one that
+    // was counting on it to give up files (which the old version would keep).
+    let mut held: Vec<String> = manifests
+        .iter()
+        .map(|(name, _, _)| name.clone())
+        .filter(|name| conflicts_of.contains_key(name))
+        .collect();
+    let mut because: HashMap<String, String> = HashMap::new();
+    // Two packages shipping one file are both at fault: letting the one that
+    // happened to be checked first win would be an arbitrary choice made on
+    // the reader's behalf.
+    for (name, conflicts) in &conflicts_of {
+        for conflict in conflicts {
+            if let extract::ExtractError::BatchConflict { other, .. } = conflict
+                && !held.contains(other)
+            {
+                because.insert(other.clone(), name.clone());
+                held.push(other.clone());
             }
-            if !elsewhere.is_empty() {
-                lines.push(
-                    "if no installed package owns what is in the way, \
-                     move it aside, then retry"
-                        .to_string(),
-                );
+        }
+    }
+    loop {
+        let next = manifests.iter().find_map(|(name, _, _)| {
+            if held.contains(name) {
+                return None;
             }
-            // A collision inside the batch is a packaging mistake in the
-            // packages themselves -- most often a split PKGBUILD whose
-            // package_*() functions both install the same file -- so the
-            // advice above, which is about the state of the root, would send
-            // the reader nowhere.
-            let in_batch = conflicts
-                .iter()
-                .any(|c| matches!(c, extract::ExtractError::BatchConflict { .. }));
-            if in_batch {
-                lines.push(
-                    "two packages in this transaction ship the same file; \
-                     only one of them can own it"
-                        .to_string(),
-                );
+            if let Some(donor) = donors_of
+                .get(name)
+                .and_then(|d| d.iter().find(|d| held.contains(*d)))
+            {
+                return Some((name.clone(), donor.clone()));
             }
-            ctx.ui.tree(&lines);
+            let package = &plan.install.iter().find(|r| r.package.name == *name)?.package;
+            held.iter()
+                .find(|h| needs(package, h, plan))
+                .map(|h| (name.clone(), h.clone()))
+        });
+        match next {
+            Some((name, cause)) => {
+                because.insert(name.clone(), cause);
+                held.push(name);
+            }
+            None => break,
+        }
+    }
+
+    if held.is_empty() {
+        spinner.succeed("no file conflicts");
+    } else {
+        spinner.fail("file conflicts detected");
+        for name in &held {
+            match conflicts_of.get(name) {
+                Some(conflicts) => {
+                    ctx.ui.err(&format!("{name}:"));
+                    ctx.ui.tree(&conflict_report(conflicts));
+                }
+                None => ctx.ui.warn(&format!(
+                    "{name} is held back along with {}",
+                    because[name]
+                )),
+            }
+        }
+        if held.len() == manifests.len() {
+            // Nothing left to do: fail the way a single-package transaction
+            // always has, naming the first package that was actually stopped.
+            let first = &held[0];
+            let in_batch = conflicts_of.get(first).is_some_and(|c| {
+                c.iter()
+                    .any(|c| matches!(c, extract::ExtractError::BatchConflict { .. }))
+            });
             // Not "installed files": a type conflict is about what is on disk,
             // which may be owned by no package at all.
             return Err(if in_batch {
-                format!("{name} conflicts with another package in this transaction")
+                format!("{first} conflicts with another package in this transaction")
             } else {
-                format!("{name} conflicts with what is already on disk")
+                format!("{first} conflicts with what is already on disk")
             });
         }
-        manifests.push((name.clone(), path.clone(), manifest));
+        ctx.ui.warn(&format!(
+            "holding back {}; installing the other {}",
+            held.join(", "),
+            manifests.len() - held.len()
+        ));
+        manifests.retain(|(name, _, _)| !held.contains(name));
     }
-    spinner.succeed("no file conflicts");
 
     let total_files: u64 = manifests.iter().map(|(_, _, m)| m.files.len() as u64).sum();
     let mut progress = ctx.ui.counter("installing", total_files, "files");
-    let mut batch = Batch::default();
+    let mut batch = Batch {
+        held_back: held,
+        ..Batch::default()
+    };
     let mut stale_caches = crate::caches::Stale::default();
 
     for (name, path, manifest) in &manifests {
@@ -3381,6 +3543,7 @@ critical = false
                 package: "sudo".into(),
                 path: "etc/sudoers".into(),
             }],
+            held_back: vec!["libpipewire".into()],
         };
         repo.absorb(Batch {
             installed: vec!["brave-bin".into()],
@@ -3390,12 +3553,14 @@ critical = false
                 package: "brave-bin".into(),
                 path: "etc/brave.conf".into(),
             }],
+            held_back: vec!["some-aur-thing".into()],
         });
 
         assert_eq!(repo.installed, vec!["sudo", "brave-bin"]);
         assert_eq!(repo.stale_removed, 5);
         assert_eq!(repo.stale_preserved.len(), 2);
         assert_eq!(repo.pacnew.len(), 2);
+        assert_eq!(repo.held_back, vec!["libpipewire", "some-aur-thing"]);
         assert_eq!(repo.pacnew[1].package, "brave-bin");
     }
 
@@ -3627,6 +3792,154 @@ critical = false
             !root.join("usr/bin/x").exists(),
             "the transaction must be refused before a byte is extracted"
         );
+    }
+
+    fn scratch_context(dir: &Path) -> Context {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir.join("root")).unwrap();
+        std::fs::create_dir_all(dir.join("db/local")).unwrap();
+        let config = crate::config::Config {
+            root_dir: dir.join("root"),
+            db_path: dir.join("db"),
+            cache_dirs: vec![dir.join("cache")],
+            log_file: dir.join("log/pacman.log"),
+            ..Default::default()
+        };
+        Context {
+            local: LocalDb::load(&config.local_db_path()),
+            config,
+            system: Default::default(),
+            sync: Vec::new(),
+            aur: crate::aur::Aur::offline(),
+            ui: crate::ui::Ui::new(),
+            keyring: std::sync::OnceLock::new(),
+            repo_only: true,
+            dry_run: false,
+            assume_yes: true,
+            keep_cache: false,
+            auto_sync: false,
+            devel: Default::default(),
+            force_rebuild: Vec::new(),
+            user_prefix: None,
+        }
+    }
+
+    fn upgrade(name: &str, depends: &[&str]) -> Resolved {
+        Resolved {
+            package: Package {
+                name: name.to_string(),
+                version: "2-1".into(),
+                depends: depends.iter().map(|d| crate::pkg::Dep::parse(d)).collect(),
+                ..Default::default()
+            },
+            reason: crate::resolve::Reason::Explicit,
+            replaces_version: Some("1-1".into()),
+        }
+    }
+
+    /// Installs `name` 1-1 into the scratch root, owning `files`.
+    fn installed(ctx: &mut Context, name: &str, files: &[&str]) {
+        for file in files {
+            let path = ctx.config.root_dir.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("{name} 1\n")).unwrap();
+        }
+        let record = Package {
+            name: name.to_string(),
+            version: "1-1".into(),
+            ..Default::default()
+        };
+        let files: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+        ctx.local.register(&record, &files).unwrap();
+    }
+
+    /// pipewire 1.4 moved its modules into libpipewire. Both were upgraded in
+    /// one run, and the check read every moved module as "already owned by
+    /// pipewire" -- which stopped all seventeen updates over a file whose old
+    /// owner was, in the same breath, giving it up.
+    #[test]
+    fn a_file_moving_between_two_packages_upgraded_together_is_not_a_conflict() {
+        let dir = std::env::temp_dir().join("rvn-handover");
+        let mut ctx = scratch_context(&dir);
+        installed(&mut ctx, "libfoo", &["usr/lib/libfoo.so"]);
+        installed(&mut ctx, "foo", &["usr/bin/foo", "usr/lib/foo/module.so"]);
+
+        let libfoo = dir.join("libfoo.tar");
+        let mut builder = tar::Builder::new(Vec::new());
+        for member in ["usr/lib/libfoo.so", "usr/lib/foo/module.so"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(2);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, member, &b"2\n"[..]).unwrap();
+        }
+        std::fs::write(&libfoo, builder.into_inner().unwrap()).unwrap();
+        let foo = dir.join("foo.tar");
+        one_file_archive(&foo, "usr/bin/foo", b"foo 2\n");
+
+        let plan = Plan {
+            install: vec![upgrade("libfoo", &[]), upgrade("foo", &["libfoo"])],
+            ..Default::default()
+        };
+        let archives = vec![("libfoo".to_string(), libfoo), ("foo".to_string(), foo)];
+        let batch = match install_archives(&mut ctx, &plan, &archives, &HashMap::new()) {
+            Ok(batch) => batch,
+            Err(e) => panic!("a file changing hands is not a conflict: {e}"),
+        };
+        assert_eq!(batch.installed, ["libfoo", "foo"]);
+        assert!(batch.held_back.is_empty());
+
+        let module = ctx.config.root_dir.join("usr/lib/foo/module.so");
+        assert_eq!(std::fs::read(&module).unwrap(), b"2\n", "the new owner's copy stays");
+        assert_eq!(
+            ctx.local.files("foo").unwrap(),
+            ["usr/bin/foo"],
+            "the old owner has let go of it"
+        );
+    }
+
+    /// The rest of the batch is not hostage to one package's conflict. What
+    /// it holds back is that package and whatever depends on it.
+    #[test]
+    fn a_conflict_holds_back_its_package_and_dependents_not_the_batch() {
+        let dir = std::env::temp_dir().join("rvn-hold-back");
+        let mut ctx = scratch_context(&dir);
+        installed(&mut ctx, "bad", &["usr/bin/bad"]);
+        installed(&mut ctx, "user", &["usr/bin/user"]);
+        installed(&mut ctx, "fine", &["usr/bin/fine"]);
+        installed(&mut ctx, "bystander", &["usr/bin/taken"]);
+
+        let bad = dir.join("bad.tar");
+        one_file_archive(&bad, "usr/bin/taken", b"bad 2\n");
+        let user = dir.join("user.tar");
+        one_file_archive(&user, "usr/bin/user", b"user 2\n");
+        let fine = dir.join("fine.tar");
+        one_file_archive(&fine, "usr/bin/fine", b"fine 2\n");
+
+        let plan = Plan {
+            install: vec![
+                upgrade("bad", &[]),
+                upgrade("user", &["bad>=2"]),
+                upgrade("fine", &[]),
+            ],
+            ..Default::default()
+        };
+        let archives = vec![
+            ("bad".to_string(), bad),
+            ("user".to_string(), user),
+            ("fine".to_string(), fine),
+        ];
+        let batch = match install_archives(&mut ctx, &plan, &archives, &HashMap::new()) {
+            Ok(batch) => batch,
+            Err(e) => panic!("one conflict must not stop the others: {e}"),
+        };
+        assert_eq!(batch.installed, ["fine"]);
+        assert_eq!(batch.held_back, ["bad", "user"]);
+
+        let root = &ctx.config.root_dir;
+        assert_eq!(std::fs::read(root.join("usr/bin/taken")).unwrap(), b"bystander 1\n");
+        assert_eq!(std::fs::read(root.join("usr/bin/user")).unwrap(), b"user 1\n");
+        assert_eq!(std::fs::read(root.join("usr/bin/fine")).unwrap(), b"fine 2\n");
     }
 
     // The sentence is the whole of the report for anyone who reads one line
