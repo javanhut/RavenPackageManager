@@ -60,7 +60,9 @@ impl Ui {
             return json::emit("banner", serde_json::json!({ "version": subtitle }));
         }
         let s = &self.style;
-        let mark = s.paint(Color::Violet, if s.unicode { "𝗿𝘃𝗻" } else { "rvn" });
+        // Plain bold ASCII rather than Mathematical Sans-Serif Bold letters:
+        // those sit outside the BMP and few terminal fonts carry them.
+        let mark = s.bold(&s.paint(Color::Violet, "rvn"));
         let name = s.bold(&s.paint(Color::White, "raven"));
         let mut err = std::io::stderr();
         let _ = writeln!(err, "\n {mark}  {name} {}", s.dim(subtitle));
