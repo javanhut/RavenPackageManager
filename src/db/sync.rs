@@ -289,6 +289,9 @@ mod tests {
         };
         let urls = package_urls(&repo, "go-1.22.0-1-x86_64.pkg.tar.zst");
         assert_eq!(urls.len(), 2);
-        assert_eq!(urls[0], "https://a/core/os/x86_64/go-1.22.0-1-x86_64.pkg.tar.zst");
+        assert_eq!(
+            urls[0],
+            "https://a/core/os/x86_64/go-1.22.0-1-x86_64.pkg.tar.zst"
+        );
     }
 }

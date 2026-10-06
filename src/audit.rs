@@ -370,7 +370,10 @@ mod tests {
         }
 
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o755, "the shipped directory was re-tightened to {mode:o}");
+        assert_eq!(
+            mode, 0o755,
+            "the shipped directory was re-tightened to {mode:o}"
+        );
         // The log file itself is still the audit trail, so it stays closed.
         let file_mode = std::fs::metadata(&log).unwrap().permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o640, "{file_mode:o}");

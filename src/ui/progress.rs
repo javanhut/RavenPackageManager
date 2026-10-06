@@ -181,8 +181,11 @@ impl Progress {
             self.unit.format(self.done),
             self.unit.format(self.total)
         );
-        let fixed =
-            self.label.chars().count() + rate.len() + counts.len() + self.detail.chars().count() + 18;
+        let fixed = self.label.chars().count()
+            + rate.len()
+            + counts.len()
+            + self.detail.chars().count()
+            + 18;
         let bar_width = self.style.width().saturating_sub(fixed).clamp(8, 40);
 
         let filled = (pct * bar_width as f64).round() as usize;

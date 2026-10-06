@@ -14,7 +14,10 @@ use std::path::Path;
 
 #[derive(Debug)]
 pub enum VerifyError {
-    ChecksumMismatch { expected: String, actual: String },
+    ChecksumMismatch {
+        expected: String,
+        actual: String,
+    },
     /// A signature was required by SigLevel but no `.sig` was available.
     SignatureMissing,
     /// The signature parsed but no key in the keyring validated it.
@@ -235,9 +238,8 @@ impl Keyring {
         // Modern GnuPG splits keys into a keybox, but pacman keeps a legacy
         // `pubring.gpg` alongside it for exactly this kind of consumer.
         let pubring = gpg_dir.join("pubring.gpg");
-        let data = std::fs::read(&pubring).map_err(|e| {
-            VerifyError::Keyring(format!("{}: {}", pubring.display(), e))
-        })?;
+        let data = std::fs::read(&pubring)
+            .map_err(|e| VerifyError::Keyring(format!("{}: {}", pubring.display(), e)))?;
         Keyring::from_bytes(&data)
     }
 
@@ -316,8 +318,7 @@ impl Keyring {
             }));
         }
 
-        Err(last_error
-            .unwrap_or_else(|| VerifyError::SignatureInvalid("no matching key".into())))
+        Err(last_error.unwrap_or_else(|| VerifyError::SignatureInvalid("no matching key".into())))
     }
 }
 
@@ -406,24 +407,21 @@ mod tests {
     #[test]
     fn siglevel_never_skips_signature_checks() {
         let path = temp_file("never", b"hello");
-        let result =
-            verify_package(&path, Some(HELLO_SHA), None, None, Level::Never).unwrap();
+        let result = verify_package(&path, Some(HELLO_SHA), None, None, Level::Never).unwrap();
         assert_eq!(result, Verified::ChecksumOnly);
     }
 
     #[test]
     fn siglevel_required_rejects_a_missing_signature() {
         let path = temp_file("required", b"hello");
-        let err =
-            verify_package(&path, Some(HELLO_SHA), None, None, Level::Required).unwrap_err();
+        let err = verify_package(&path, Some(HELLO_SHA), None, None, Level::Required).unwrap_err();
         assert!(matches!(err, VerifyError::SignatureMissing));
     }
 
     #[test]
     fn siglevel_optional_accepts_a_missing_signature() {
         let path = temp_file("optional", b"hello");
-        let result =
-            verify_package(&path, Some(HELLO_SHA), None, None, Level::Optional).unwrap();
+        let result = verify_package(&path, Some(HELLO_SHA), None, None, Level::Optional).unwrap();
         assert_eq!(result, Verified::ChecksumOnly);
     }
 
@@ -432,8 +430,14 @@ mod tests {
         let path = temp_file("early-exit", b"hello");
         // No keyring is supplied, so reaching the signature stage would panic
         // on the unwrap path; a checksum failure must short-circuit first.
-        let err = verify_package(&path, Some(&"a".repeat(64)), Some(b"junk"), None, Level::Required)
-            .unwrap_err();
+        let err = verify_package(
+            &path,
+            Some(&"a".repeat(64)),
+            Some(b"junk"),
+            None,
+            Level::Required,
+        )
+        .unwrap_err();
         assert!(matches!(err, VerifyError::ChecksumMismatch { .. }));
     }
 
@@ -459,10 +463,12 @@ mod tests {
 
     #[test]
     fn garbage_signature_bytes_do_not_panic() {
-        let keyring = Keyring {
-            keys: Vec::new(),
-        };
-        assert!(keyring.verify_detached(b"data", b"not a signature").is_err());
+        let keyring = Keyring { keys: Vec::new() };
+        assert!(
+            keyring
+                .verify_detached(b"data", b"not a signature")
+                .is_err()
+        );
     }
 
     /// Builds an old-format packet, the shape GnuPG writes trust packets in.
@@ -499,7 +505,10 @@ mod tests {
         ring.extend(old_packet(14, b"signing subkey"));
 
         let stripped = strip_trust_packets(&ring);
-        assert!(matches!(stripped, Cow::Owned(_)), "trust packets were present");
+        assert!(
+            matches!(stripped, Cow::Owned(_)),
+            "trust packets were present"
+        );
 
         let tags: Vec<u8> = packet_spans(&stripped)
             .unwrap()

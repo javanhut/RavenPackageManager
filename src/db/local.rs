@@ -81,9 +81,9 @@ impl LocalDb {
 
     /// The files owned by an installed package, as recorded in its `files`.
     pub fn files(&self, name: &str) -> io::Result<Vec<String>> {
-        let pkg = self
-            .get(name)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{name} not installed")))?;
+        let pkg = self.get(name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("{name} not installed"))
+        })?;
         let dir = self.root.join(format!("{}-{}", pkg.name, pkg.version));
         let text = std::fs::read_to_string(dir.join("files"))?;
         Ok(desc::parse_fields(&text)
@@ -258,15 +258,24 @@ impl LocalDb {
         );
         field(
             "PROVIDES",
-            &pkg.provides.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
+            &pkg.provides
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>(),
         );
         field(
             "DEPENDS",
-            &pkg.depends.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
+            &pkg.depends
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>(),
         );
         field(
             "CONFLICTS",
-            &pkg.conflicts.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
+            &pkg.conflicts
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>(),
         );
 
         std::fs::write(dir.join("desc"), desc_out)?;
@@ -357,8 +366,11 @@ mod tests {
             isize: 9_000_000,
             ..Default::default()
         };
-        db.register(&pkg, &["usr/bin/bash".into(), "usr/share/man/bash.1".into()])
-            .unwrap();
+        db.register(
+            &pkg,
+            &["usr/bin/bash".into(), "usr/share/man/bash.1".into()],
+        )
+        .unwrap();
 
         // Re-read from disk to prove the on-disk format parses back.
         let reread = LocalDb::load(&root);
@@ -415,7 +427,8 @@ mod tests {
         };
         db.register(&pkg, &["etc/sudoers".into()]).unwrap();
 
-        db.set_backup_hash("sudo", "etc/sudoers", "deadbeef").unwrap();
+        db.set_backup_hash("sudo", "etc/sudoers", "deadbeef")
+            .unwrap();
 
         let reread = LocalDb::load(&root);
         let got = reread.get("sudo").unwrap();
@@ -452,7 +465,8 @@ mod tests {
                 .to_string()
         };
 
-        db.set_backup_hash("demo", "etc/demo.conf", "abc123").unwrap();
+        db.set_backup_hash("demo", "etc/demo.conf", "abc123")
+            .unwrap();
         let after = std::fs::read_to_string(&desc).unwrap();
 
         assert_eq!(stamp(&before), stamp(&after));
@@ -476,7 +490,8 @@ mod tests {
 
         db.set_backup_hash("demo", "etc/elsewhere.conf", "abc123")
             .unwrap();
-        db.set_backup_hash("absent", "etc/demo.conf", "abc123").unwrap();
+        db.set_backup_hash("absent", "etc/demo.conf", "abc123")
+            .unwrap();
 
         let reread = LocalDb::load(&root);
         let got = reread.get("demo").unwrap();

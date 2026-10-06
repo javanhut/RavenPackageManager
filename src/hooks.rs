@@ -131,9 +131,7 @@ fn apply_sysusers(root: &Path, text: &str, applied: &mut Applied, warn: &mut imp
                 match add_membership(root, user, group) {
                     Ok(true) => applied.memberships.push((user.clone(), group.clone())),
                     Ok(false) => {}
-                    Err(e) => {
-                        warn(&format!("sysusers: could not add {user} to {group}: {e}"))
-                    }
+                    Err(e) => warn(&format!("sysusers: could not add {user} to {group}: {e}")),
                 }
             }
             // `r` (uid ranges) and anything unrecognised: not needed by the
@@ -213,9 +211,7 @@ fn append_db(root: &Path, name: &str, line: &str) -> std::io::Result<()> {
 }
 
 fn name_exists(content: &str, name: &str) -> bool {
-    content
-        .lines()
-        .any(|l| l.split(':').next() == Some(name))
+    content.lines().any(|l| l.split(':').next() == Some(name))
 }
 
 fn ids_in_use(content: &str, field: usize) -> HashSet<u32> {
@@ -233,13 +229,52 @@ fn free_system_id(used: &HashSet<u32>) -> Option<u32> {
     (100..=999).rev().find(|id| !used.contains(id))
 }
 
-fn parse_or_free(spec: &str, used: &HashSet<u32>) -> Option<u32> {
-    if spec == "-" {
+/// Resolves one half of a sysusers ID field to a number.
+///
+/// sysusers.d(5) allows three spellings here, and Arch packages use all of
+/// them:
+///
+///   -              any free system id
+///   81             exactly that id
+///   /var/lib/foo   the id that owns that path, if no entry already has it;
+///                  a free one otherwise. libvirt declares its QEMU account
+///                  as `u! libvirt-qemu /var/lib/libvirt`, and before this
+///                  was understood the line was rejected, the account was
+///                  never created, and libvirtd refused to start.
+///
+/// The path is looked up under `root`, the system being installed into, not
+/// under the host. `owner` picks the uid or the gid off the path's metadata.
+fn resolve_id(
+    root: &Path,
+    spec: &str,
+    used: &HashSet<u32>,
+    owner: impl Fn(&std::fs::Metadata) -> u32,
+) -> std::io::Result<u32> {
+    use std::io::{Error, ErrorKind};
+
+    let free = || {
         free_system_id(used)
-    } else {
-        // `uid:gid` appears occasionally; the uid half is what names the user.
-        spec.split(':').next()?.parse().ok()
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "no free id in 100-999"))
+    };
+
+    if spec == "-" || spec.is_empty() {
+        return free();
     }
+    if let Some(rel) = spec.strip_prefix('/') {
+        // A path whose owner is already taken -- root, typically -- is the
+        // common case, not an error: the path is a preference, and sysusers
+        // falls back to a free id exactly as it does for `-`.
+        return match std::fs::metadata(root.join(rel)).map(|m| owner(&m)) {
+            Ok(id) if !used.contains(&id) => Ok(id),
+            _ => free(),
+        };
+    }
+    spec.parse().map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("unrecognised id {spec:?} (expected -, a number or a path)"),
+        )
+    })
 }
 
 /// Days since the epoch, for the shadow "last changed" field.
@@ -256,8 +291,10 @@ fn ensure_group(root: &Path, name: &str, gid_spec: &str) -> std::io::Result<Opti
         return Ok(None);
     }
     let used = ids_in_use(&group, 2);
-    let gid = parse_or_free(gid_spec, &used).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "no free gid in 100-999")
+    // A `g` line's ID is a gid on its own; `uid:gid` only means anything on a
+    // `u` line, and ensure_user splits it before calling here.
+    let gid = resolve_id(root, gid_spec, &used, |m| {
+        std::os::unix::fs::MetadataExt::gid(m)
     })?;
     append_db(root, "group", &format!("{name}:x:{gid}:"))?;
     Ok(Some(gid))
@@ -275,20 +312,34 @@ fn ensure_user(
         return Ok(false);
     }
 
-    // A sysusers `u` line declares the group of the same name with it.
-    let gid = match ensure_group(root, name, uid_spec)? {
-        Some(gid) => gid,
-        None => read_db(root, "group")
-            .lines()
-            .find(|l| l.split(':').next() == Some(name))
-            .and_then(|l| l.split(':').nth(2))
-            .and_then(|g| g.parse().ok())
-            .unwrap_or(65534),
+    // `uid:gid` or `uid:group` names the primary group explicitly; a bare
+    // uid (or `-`, or a path) means a group of the user's own name, with the
+    // same id when it is free.
+    let (uid_spec, group_spec) = match uid_spec.split_once(':') {
+        Some((uid, group)) => (uid, Some(group)),
+        None => (uid_spec, None),
+    };
+
+    let gid = match group_spec {
+        // An existing group by name: the user joins it as its primary group
+        // and no group of the user's own name is made. sysusers creates the
+        // named group if nothing has yet, and so does this.
+        Some(group) if group.parse::<u32>().is_err() && group != "-" => {
+            match ensure_group(root, group, "-")? {
+                Some(gid) => gid,
+                None => group_id(root, group).unwrap_or(65534),
+            }
+        }
+        // A sysusers `u` line declares the group of the same name with it.
+        _ => match ensure_group(root, name, group_spec.unwrap_or(uid_spec))? {
+            Some(gid) => gid,
+            None => group_id(root, name).unwrap_or(65534),
+        },
     };
 
     let used = ids_in_use(&passwd, 2);
-    let uid = parse_or_free(uid_spec, &used).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "no free uid in 100-999")
+    let uid = resolve_id(root, uid_spec, &used, |m| {
+        std::os::unix::fs::MetadataExt::uid(m)
     })?;
 
     let gecos = if gecos == "-" { name } else { gecos };
@@ -300,8 +351,21 @@ fn ensure_user(
         &format!("{name}:x:{uid}:{gid}:{gecos}:{home}:/bin/false"),
     )?;
     // Locked: these accounts exist to own processes and files, not to log in.
-    append_db(root, "shadow", &format!("{name}:!:{}:0:99999:7:::", today()))?;
+    append_db(
+        root,
+        "shadow",
+        &format!("{name}:!:{}:0:99999:7:::", today()),
+    )?;
     Ok(true)
+}
+
+/// The gid of an existing group, by name.
+fn group_id(root: &Path, name: &str) -> Option<u32> {
+    read_db(root, "group")
+        .lines()
+        .find(|l| l.split(':').next() == Some(name))
+        .and_then(|l| l.split(':').nth(2))
+        .and_then(|g| g.parse().ok())
 }
 
 fn add_membership(root: &Path, user: &str, group: &str) -> std::io::Result<bool> {
@@ -458,14 +522,27 @@ mod tests {
             "# comment\nu dbus 81 \"System Message Bus\"\n",
         );
 
-        let applied = apply(&root, &["usr/lib/sysusers.d/dbus.conf".into()], &mut no_warn());
+        let applied = apply(
+            &root,
+            &["usr/lib/sysusers.d/dbus.conf".into()],
+            &mut no_warn(),
+        );
 
         assert_eq!(applied.users, vec!["dbus"]);
         let passwd = std::fs::read_to_string(root.join("etc/passwd")).unwrap();
-        assert!(passwd.contains("dbus:x:81:81:System Message Bus:/:/bin/false"), "{passwd}");
-        assert!(passwd.starts_with("root:"), "existing entries survive: {passwd}");
+        assert!(
+            passwd.contains("dbus:x:81:81:System Message Bus:/:/bin/false"),
+            "{passwd}"
+        );
+        assert!(
+            passwd.starts_with("root:"),
+            "existing entries survive: {passwd}"
+        );
         let shadow = std::fs::read_to_string(root.join("etc/shadow")).unwrap();
-        assert!(shadow.starts_with("dbus:!:"), "locked, not passwordless: {shadow}");
+        assert!(
+            shadow.starts_with("dbus:!:"),
+            "locked, not passwordless: {shadow}"
+        );
     }
 
     #[test]
@@ -475,7 +552,11 @@ mod tests {
         write(&root, "etc/group", "dbus:x:81:\n");
         write(&root, "usr/lib/sysusers.d/dbus.conf", "u dbus 81\n");
 
-        let applied = apply(&root, &["usr/lib/sysusers.d/dbus.conf".into()], &mut no_warn());
+        let applied = apply(
+            &root,
+            &["usr/lib/sysusers.d/dbus.conf".into()],
+            &mut no_warn(),
+        );
 
         assert!(applied.is_empty());
         assert_eq!(
@@ -491,7 +572,11 @@ mod tests {
         let root = root("sysusers-dash");
         write(&root, "etc/passwd", "root:x:0:0:root:/root:/bin/bash\n");
         write(&root, "etc/group", "root:x:0:\n");
-        write(&root, "usr/lib/sysusers.d/x.conf", "u! avahi - - /var/run/avahi\n");
+        write(
+            &root,
+            "usr/lib/sysusers.d/x.conf",
+            "u! avahi - - /var/run/avahi\n",
+        );
 
         let applied = apply(&root, &["usr/lib/sysusers.d/x.conf".into()], &mut no_warn());
 
@@ -506,6 +591,211 @@ mod tests {
             .unwrap();
         assert!((100..=999).contains(&uid), "system range, got {uid}");
         assert!(passwd.contains(":/var/run/avahi:"));
+    }
+
+    fn entry(root: &Path, db: &str, name: &str) -> Vec<String> {
+        std::fs::read_to_string(root.join("etc").join(db))
+            .unwrap()
+            .lines()
+            .find(|l| l.split(':').next() == Some(name))
+            .unwrap_or_else(|| panic!("no {name} in {db}"))
+            .split(':')
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// libvirt's actual fragment. The ID is a path owned by root, whose uid is
+    /// taken, so the account gets a free system id -- before path IDs were
+    /// understood the line was rejected, libvirt-qemu never existed, and the
+    /// `m` line below it made a member of a user nobody had created.
+    #[test]
+    fn a_path_id_owned_by_a_taken_id_falls_back_to_a_free_one() {
+        let root = root("sysusers-path-taken");
+        write(
+            &root,
+            "etc/passwd",
+            "root:x:0:0:root:/root:/bin/bash
+",
+        );
+        write(
+            &root,
+            "etc/group",
+            "root:x:0:
+kvm:x:992:
+",
+        );
+        std::fs::create_dir_all(root.join("var/lib/libvirt")).unwrap();
+        let owner = std::os::unix::fs::MetadataExt::uid(
+            &std::fs::metadata(root.join("var/lib/libvirt")).unwrap(),
+        );
+        // Whoever runs the tests owns the directory; make that id the taken
+        // one, which is what root's 0 is on a real system.
+        write(
+            &root,
+            "etc/passwd",
+            &format!(
+                "root:x:0:0:root:/root:/bin/bash
+me:x:{owner}:{owner}::/:/bin/sh
+"
+            ),
+        );
+        write(
+            &root,
+            "etc/group",
+            &format!(
+                "root:x:0:
+me:x:{owner}:
+kvm:x:992:
+"
+            ),
+        );
+        write(
+            &root,
+            "usr/lib/sysusers.d/libvirt.conf",
+            "g libvirt -\nu! libvirt-qemu /var/lib/libvirt \"Libvirt QEMU user\"\nm libvirt-qemu kvm\n",
+        );
+
+        let applied = apply(
+            &root,
+            &["usr/lib/sysusers.d/libvirt.conf".into()],
+            &mut no_warn(),
+        );
+
+        assert_eq!(applied.users, vec!["libvirt-qemu"]);
+        let user = entry(&root, "passwd", "libvirt-qemu");
+        let uid: u32 = user[2].parse().unwrap();
+        assert!((100..=999).contains(&uid), "system range, got {uid}");
+        assert_eq!(user[4], "Libvirt QEMU user");
+        assert_eq!(
+            entry(&root, "group", "libvirt-qemu")[2],
+            user[3],
+            "own group is primary"
+        );
+        assert_eq!(entry(&root, "group", "kvm")[3], "libvirt-qemu");
+    }
+
+    /// The other half of the path rule: an owner nobody has claimed is used.
+    #[test]
+    fn a_path_id_takes_its_owner_when_that_id_is_free() {
+        let root = root("sysusers-path-free");
+        write(
+            &root,
+            "etc/passwd",
+            "root:x:0:0:root:/root:/bin/bash
+",
+        );
+        write(
+            &root,
+            "etc/group",
+            "root:x:0:
+",
+        );
+        std::fs::create_dir_all(root.join("srv/thing")).unwrap();
+        let meta = std::fs::metadata(root.join("srv/thing")).unwrap();
+        let (owner, group) = (
+            std::os::unix::fs::MetadataExt::uid(&meta),
+            std::os::unix::fs::MetadataExt::gid(&meta),
+        );
+        if owner == 0 {
+            // Running as root: the owner is taken, and the test above covers it.
+            return;
+        }
+        write(&root, "usr/lib/sysusers.d/x.conf", "u thing /srv/thing\n");
+
+        apply(&root, &["usr/lib/sysusers.d/x.conf".into()], &mut no_warn());
+
+        let user = entry(&root, "passwd", "thing");
+        assert_eq!(user[2], owner.to_string());
+        assert_eq!(user[3], group.to_string());
+    }
+
+    #[test]
+    fn a_uid_and_gid_pair_sets_each_half() {
+        let root = root("sysusers-pair");
+        write(
+            &root,
+            "etc/passwd",
+            "root:x:0:0:root:/root:/bin/bash
+",
+        );
+        write(
+            &root,
+            "etc/group",
+            "root:x:0:
+",
+        );
+        write(
+            &root,
+            "usr/lib/sysusers.d/x.conf",
+            "u polkitd 102:105 \"User for polkitd\"\n",
+        );
+
+        apply(&root, &["usr/lib/sysusers.d/x.conf".into()], &mut no_warn());
+
+        let user = entry(&root, "passwd", "polkitd");
+        assert_eq!((user[2].as_str(), user[3].as_str()), ("102", "105"));
+        assert_eq!(entry(&root, "group", "polkitd")[2], "105");
+    }
+
+    /// `-:kvm`: a free uid, with an existing group as the primary one and no
+    /// group of the user's own name.
+    #[test]
+    fn a_named_group_becomes_the_primary_group() {
+        let root = root("sysusers-named-group");
+        write(
+            &root,
+            "etc/passwd",
+            "root:x:0:0:root:/root:/bin/bash
+",
+        );
+        write(
+            &root,
+            "etc/group",
+            "root:x:0:
+kvm:x:992:
+",
+        );
+        write(&root, "usr/lib/sysusers.d/x.conf", "u qemu -:kvm\n");
+
+        apply(&root, &["usr/lib/sysusers.d/x.conf".into()], &mut no_warn());
+
+        assert_eq!(entry(&root, "passwd", "qemu")[3], "992");
+        let group = std::fs::read_to_string(root.join("etc/group")).unwrap();
+        assert!(!group.lines().any(|l| l.starts_with("qemu:")), "{group}");
+    }
+
+    /// Something that is none of the spellings is reported by name, not as
+    /// the old "no free gid in 100-999", which sent people looking at a
+    /// range that was nearly empty.
+    #[test]
+    fn an_unrecognised_id_is_reported_and_creates_nothing() {
+        let root = root("sysusers-bad-id");
+        write(
+            &root,
+            "etc/passwd",
+            "root:x:0:0:root:/root:/bin/bash
+",
+        );
+        write(
+            &root,
+            "etc/group",
+            "root:x:0:
+",
+        );
+        write(&root, "usr/lib/sysusers.d/x.conf", "u odd abc\n");
+
+        let mut warnings = Vec::new();
+        let applied = apply(
+            &root,
+            &["usr/lib/sysusers.d/x.conf".into()],
+            &mut |m: &str| warnings.push(m.to_string()),
+        );
+
+        assert!(applied.users.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("\"abc\""), "{warnings:?}");
+        let passwd = std::fs::read_to_string(root.join("etc/passwd")).unwrap();
+        assert!(!passwd.contains("odd:"), "{passwd}");
     }
 
     #[test]
@@ -540,7 +830,10 @@ mod tests {
             "usr/lib/tmpfiles.d/journal-nocow.conf",
             "usr/lib/tmpfiles.d/audit.conf",
         ] {
-            assert!(tmpfiles_fragment_is_for_a_daemon_raven_never_runs(skipped), "{skipped}");
+            assert!(
+                tmpfiles_fragment_is_for_a_daemon_raven_never_runs(skipped),
+                "{skipped}"
+            );
         }
         for kept in [
             "usr/lib/tmpfiles.d/dbus.conf",
@@ -549,7 +842,10 @@ mod tests {
             "usr/lib/tmpfiles.d/x11.conf",
             "usr/lib/tmpfiles.d/openssh.conf",
         ] {
-            assert!(!tmpfiles_fragment_is_for_a_daemon_raven_never_runs(kept), "{kept}");
+            assert!(
+                !tmpfiles_fragment_is_for_a_daemon_raven_never_runs(kept),
+                "{kept}"
+            );
         }
         // And through the front door: a systemd fragment creates nothing.
         let root = root("tmpfiles-skip");
@@ -566,11 +862,20 @@ mod tests {
         .unwrap();
         let applied = apply(
             &root,
-            &["usr/lib/tmpfiles.d/systemd.conf".to_string(), "usr/lib/tmpfiles.d/dbus.conf".to_string()],
+            &[
+                "usr/lib/tmpfiles.d/systemd.conf".to_string(),
+                "usr/lib/tmpfiles.d/dbus.conf".to_string(),
+            ],
             &mut |_| {},
         );
-        assert!(!root.join("var/log/private").exists(), "systemd's fragment must be skipped");
-        assert!(root.join("run/dbus").is_dir(), "dbus's fragment still applies");
+        assert!(
+            !root.join("var/log/private").exists(),
+            "systemd's fragment must be skipped"
+        );
+        assert!(
+            root.join("run/dbus").is_dir(),
+            "dbus's fragment still applies"
+        );
         assert_eq!(applied.directories, vec!["/run/dbus".to_string()]);
     }
 
@@ -587,11 +892,18 @@ mod tests {
             "C /etc/pam.d/sshd\nC /etc/ssh/sshd_config\n\nd /etc/ssh/sshd_config.d\n",
         );
 
-        let applied = apply(&root, &["usr/lib/tmpfiles.d/openssh.conf".into()], &mut no_warn());
+        let applied = apply(
+            &root,
+            &["usr/lib/tmpfiles.d/openssh.conf".into()],
+            &mut no_warn(),
+        );
 
         assert_eq!(applied.copied, vec!["/etc/ssh/sshd_config"]);
         assert_eq!(applied.directories, vec!["/etc/ssh/sshd_config.d"]);
-        assert_eq!(std::fs::read_to_string(root.join("etc/ssh/sshd_config")).unwrap(), "Port 22\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("etc/ssh/sshd_config")).unwrap(),
+            "Port 22\n"
+        );
         assert_eq!(
             std::fs::read_to_string(root.join("etc/pam.d/sshd")).unwrap(),
             "mine\n",

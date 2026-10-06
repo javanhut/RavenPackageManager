@@ -1090,7 +1090,10 @@ pub fn run_service(action: ServiceAction, name: &str, report: &mut dyn FnMut(&st
                 return;
             }
             match crate::initctl::start(socket, name) {
-                Ok(_) => ok(report, format!("'{name}' is running, and will start at boot")),
+                Ok(_) => ok(
+                    report,
+                    format!("'{name}' is running, and will start at boot"),
+                ),
                 Err(e) => failed(
                     report,
                     format!(
@@ -1837,7 +1840,10 @@ mod tests {
             op: Some(Op::Sync),
             ..Default::default()
         };
-        assert_eq!(r.validate().unwrap().argv(), vec!["--json", "--yes", "sync"]);
+        assert_eq!(
+            r.validate().unwrap().argv(),
+            vec!["--json", "--yes", "sync"]
+        );
         let r = Request {
             op: Some(Op::Update),
             no_refresh: true,
@@ -1964,10 +1970,9 @@ mod tests {
         assert_eq!(plan.describe(), "service enable faced");
         // The wire form is the lowercase word, which is what a front-end
         // writing JSON by hand would guess.
-        let r: Request = serde_json::from_str(
-            r#"{"op":"service","service":"faced","action":"enable"}"#,
-        )
-        .expect("parses");
+        let r: Request =
+            serde_json::from_str(r#"{"op":"service","service":"faced","action":"enable"}"#)
+                .expect("parses");
         assert_eq!(r.action, Some(ServiceAction::Enable));
         assert_eq!(r.op, Some(Op::Service));
     }
@@ -2342,7 +2347,10 @@ mod tests {
         );
         assert!(decision.allowed, "{}", decision.reason);
         assert_eq!(decision.how, "unavailable");
-        assert!(decision.warning.is_some(), "an allow nobody authorized says so");
+        assert!(
+            decision.warning.is_some(),
+            "an allow nobody authorized says so"
+        );
     }
 
     /// The same caller, on a machine where a ravend *is* listening.

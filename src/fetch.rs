@@ -19,11 +19,20 @@ const USER_AGENT: &str = concat!("rvn/", env!("CARGO_PKG_VERSION"));
 #[derive(Debug)]
 pub enum FetchError {
     /// Every mirror was tried and none served the file.
-    AllMirrorsFailed { url: String, attempts: Vec<String> },
+    AllMirrorsFailed {
+        url: String,
+        attempts: Vec<String>,
+    },
     Io(io::Error),
-    Status { url: String, code: u16 },
+    Status {
+        url: String,
+        code: u16,
+    },
     /// The connection failed before any status was returned.
-    Transport { url: String, reason: String },
+    Transport {
+        url: String,
+        reason: String,
+    },
     /// The server sent fewer bytes than it promised.
     Truncated {
         url: String,
@@ -480,12 +489,10 @@ pub fn download_optional(urls: &[String], dest: &Path) -> Optional {
 
         match stream_to(&agent, url, &mut writer, |_| {}) {
             Ok(total) => {
-                let renamed = writer
-                    .flush()
-                    .and_then(|_| {
-                        drop(writer);
-                        std::fs::rename(&part, dest)
-                    });
+                let renamed = writer.flush().and_then(|_| {
+                    drop(writer);
+                    std::fs::rename(&part, dest)
+                });
                 return match renamed {
                     Ok(()) => Optional::Fetched(total),
                     Err(e) => Optional::Unavailable(FetchError::Io(e)),

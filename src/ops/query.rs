@@ -77,7 +77,11 @@ pub fn info(ctx: &Context, names: &[String]) -> Result<(), String> {
 
         println!(
             "{}",
-            s.bold(&format!("{}/{}", s.paint(Color::Violet, origin.label()), pkg.name))
+            s.bold(&format!(
+                "{}/{}",
+                s.paint(Color::Violet, origin.label()),
+                pkg.name
+            ))
         );
         field("Version", &s.paint(Color::Green, &pkg.version));
         field("Description", &pkg.description);
@@ -86,7 +90,10 @@ pub fn info(ctx: &Context, names: &[String]) -> Result<(), String> {
         field("Architecture", pkg.arch.as_deref().unwrap_or(""));
 
         let deps = |list: &[crate::pkg::Dep]| {
-            list.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("  ")
+            list.iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join("  ")
         };
         field("Provides", &deps(&pkg.provides));
         field("Depends On", &deps(&pkg.depends));
@@ -152,7 +159,14 @@ pub fn info(ctx: &Context, names: &[String]) -> Result<(), String> {
                     },
                 );
                 if let Some(tracked) = ctx.devel.get(name) {
-                    field("Upstream", &format!("{} @ {}", tracked.url, &tracked.commit[..tracked.commit.len().min(9)]));
+                    field(
+                        "Upstream",
+                        &format!(
+                            "{} @ {}",
+                            tracked.url,
+                            &tracked.commit[..tracked.commit.len().min(9)]
+                        ),
+                    );
                 }
             }
             None => field("Installed", &s.dim("no")),
@@ -216,7 +230,11 @@ pub fn list(ctx: &Context, filter: ListFilter) -> Result<usize, String> {
         } else {
             s.paint(Color::Violet, "repo")
         };
-        let mut line = format!("{tag}/{} {}", s.bold(&pkg.name), s.paint(Color::Green, &pkg.version));
+        let mut line = format!(
+            "{tag}/{} {}",
+            s.bold(&pkg.name),
+            s.paint(Color::Green, &pkg.version)
+        );
         if pkg.install_reason == InstallReason::Dependency {
             line.push_str(&format!(" {}", s.dim("(dependency)")));
         }
@@ -244,9 +262,7 @@ pub fn owns(ctx: &Context, paths: &[String]) -> Result<(), String> {
 
     for query in paths {
         // Accept both absolute paths and database-relative ones.
-        let relative = query
-            .trim_start_matches('/')
-            .to_string();
+        let relative = query.trim_start_matches('/').to_string();
 
         match index.get(&relative) {
             Some(owner) => {

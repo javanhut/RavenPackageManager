@@ -32,9 +32,8 @@ pub fn message(kind: &str, text: &str) {
 }
 
 pub fn package(pkg: &Package) -> Value {
-    let deps = |list: &[crate::pkg::Dep]| -> Vec<String> {
-        list.iter().map(|d| d.to_string()).collect()
-    };
+    let deps =
+        |list: &[crate::pkg::Dep]| -> Vec<String> { list.iter().map(|d| d.to_string()).collect() };
     json!({
         "name": pkg.name,
         "version": pkg.version,
