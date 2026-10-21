@@ -100,12 +100,23 @@ struct Batch {
     /// Packages left out because of a file conflict, their own or one they
     /// depend on. The rest of the batch still went in.
     held_back: Vec<String>,
+    /// AUR packages whose build failed. Like a conflict, one bad PKGBUILD
+    /// stops that package and what needs it, not the rest of an update.
+    failed: Vec<String>,
+    /// Why the first package that was stopped was stopped, in the words a
+    /// single-package transaction has always failed with. The transaction
+    /// fails with it when nothing at all went in.
+    refusal: Option<String>,
 }
 
 impl Batch {
     fn absorb(&mut self, other: Batch) {
         self.installed.extend(other.installed);
         self.held_back.extend(other.held_back);
+        self.failed.extend(other.failed);
+        if self.refusal.is_none() {
+            self.refusal = other.refusal;
+        }
         self.stale_removed += other.stale_removed;
         self.stale_preserved.extend(other.stale_preserved);
         self.pacnew.extend(other.pacnew);
@@ -367,7 +378,12 @@ pub fn execute(ctx: &mut Context, targets: &[String]) -> Result<Outcome, String>
         let pkg = &resolved.package;
         // Built against the version installed rather than the one it was
         // resolved against, it would be broken the moment it landed.
-        if let Some(held) = batch.held_back.iter().find(|h| needs(pkg, h, &plan)) {
+        if let Some(held) = batch
+            .held_back
+            .iter()
+            .chain(&batch.failed)
+            .find(|h| needs(pkg, h, &plan))
+        {
             ctx.ui.warn(&format!(
                 "{} needs {held}, which was held back, so it is not built",
                 pkg.name
@@ -385,7 +401,10 @@ pub fn execute(ctx: &mut Context, targets: &[String]) -> Result<Outcome, String>
             }
             Err(e) => {
                 spinner.fail(&format!("{} failed to build", pkg.name));
-                return Err(format!("{}: {e}", pkg.name));
+                ctx.ui.err(&format!("{}: {e}", pkg.name));
+                batch.failed.push(pkg.name.clone());
+                batch.refusal.get_or_insert(format!("{}: {e}", pkg.name));
+                continue;
             }
         };
 
@@ -412,14 +431,27 @@ pub fn execute(ctx: &mut Context, targets: &[String]) -> Result<Outcome, String>
         }
 
         if built.is_empty() {
-            return Err(format!(
+            let why = format!(
                 "{} built successfully but produced nothing matching the request",
                 pkg.name
-            ));
+            );
+            ctx.ui.err(&why);
+            batch.failed.push(pkg.name.clone());
+            batch.refusal.get_or_insert(why);
+            continue;
         }
 
         batch.absorb(install_archives(ctx, &plan, &built, &validations)?);
         built_archives.extend(built.into_iter().map(|(_, path)| path));
+    }
+
+    // Everything was stopped: fail the way a single-package transaction
+    // always has. Anything less than everything is reported in the summary
+    // and the rest of the transaction stands.
+    if batch.installed.is_empty()
+        && let Some(refusal) = batch.refusal.take()
+    {
+        return Err(refusal);
     }
 
     if batch.stale_removed > 0 {
@@ -535,6 +567,10 @@ pub fn execute(ctx: &mut Context, targets: &[String]) -> Result<Outcome, String>
             "held back by file conflicts: {}",
             batch.held_back.join(", ")
         ));
+    }
+    if !batch.failed.is_empty() {
+        ctx.ui
+            .warn(&format!("failed to build: {}", batch.failed.join(", ")));
     }
 
     // A .pacnew is the one thing a transaction leaves unfinished for a human,
@@ -715,6 +751,9 @@ pub fn install_from_cache(
     let validations = HashMap::from([(package.to_string(), validation)]);
     let archives = vec![(package.to_string(), archive.to_path_buf())];
     let batch = install_archives(ctx, &plan, &archives, &validations)?;
+    if let Some(refusal) = batch.refusal {
+        return Err(refusal);
+    }
 
     let after = txhooks::Transaction::new(
         operations,
@@ -1549,8 +1588,10 @@ fn install_archives(
             }
         }
         if held.len() == manifests.len() {
-            // Nothing left to do: fail the way a single-package transaction
-            // always has, naming the first package that was actually stopped.
+            // Nothing left to do in this call. Not an error here: an update
+            // installs each AUR package with a call of its own, and failing
+            // would stop every package after this one. The caller fails the
+            // transaction with this reason if nothing else went in either.
             let first = &held[0];
             let in_batch = conflicts_of.get(first).is_some_and(|c| {
                 c.iter()
@@ -1558,10 +1599,15 @@ fn install_archives(
             });
             // Not "installed files": a type conflict is about what is on disk,
             // which may be owned by no package at all.
-            return Err(if in_batch {
+            let refusal = if in_batch {
                 format!("{first} conflicts with another package in this transaction")
             } else {
                 format!("{first} conflicts with what is already on disk")
+            };
+            return Ok(Batch {
+                held_back: held,
+                refusal: Some(refusal),
+                ..Batch::default()
             });
         }
         ctx.ui.warn(&format!(
@@ -3585,6 +3631,8 @@ critical = false
                 path: "etc/sudoers".into(),
             }],
             held_back: vec!["libpipewire".into()],
+            failed: Vec::new(),
+            refusal: None,
         };
         repo.absorb(Batch {
             installed: vec!["brave-bin".into()],
@@ -3595,6 +3643,8 @@ critical = false
                 path: "etc/brave.conf".into(),
             }],
             held_back: vec!["some-aur-thing".into()],
+            failed: vec!["broken-pkgbuild".into()],
+            refusal: Some("broken-pkgbuild: build failed".into()),
         });
 
         assert_eq!(repo.installed, vec!["sudo", "brave-bin"]);
@@ -3602,6 +3652,11 @@ critical = false
         assert_eq!(repo.stale_preserved.len(), 2);
         assert_eq!(repo.pacnew.len(), 2);
         assert_eq!(repo.held_back, vec!["libpipewire", "some-aur-thing"]);
+        assert_eq!(repo.failed, vec!["broken-pkgbuild"]);
+        assert_eq!(
+            repo.refusal.as_deref(),
+            Some("broken-pkgbuild: build failed")
+        );
         assert_eq!(repo.pacnew[1].package, "brave-bin");
     }
 
@@ -3825,11 +3880,21 @@ critical = false
         };
 
         let archives = vec![("a".to_string(), a), ("b".to_string(), b)];
-        let err = match install_archives(&mut ctx, &plan, &archives, &HashMap::new()) {
-            Err(e) => e,
-            Ok(_) => panic!("two packages shipping usr/bin/x must be refused"),
+        // Refused, but as a held-back batch rather than an error: an update
+        // installs each AUR package in a call of its own, and an error here
+        // would stop every package after it.
+        let batch = match install_archives(&mut ctx, &plan, &archives, &HashMap::new()) {
+            Ok(batch) => batch,
+            Err(e) => panic!("a conflict is reported in the batch, not as an error: {e}"),
         };
-        assert!(err.contains("this transaction"), "{err}");
+        assert!(batch.installed.is_empty());
+        let mut held = batch.held_back.clone();
+        held.sort();
+        assert_eq!(held, ["a", "b"]);
+        let refusal = batch
+            .refusal
+            .expect("two packages shipping usr/bin/x must be refused");
+        assert!(refusal.contains("this transaction"), "{refusal}");
 
         // And refused before anything was written.
         assert!(
