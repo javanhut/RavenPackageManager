@@ -17,7 +17,7 @@ fn main() {
     let mut policy_path = PathBuf::from(rvn::policy::DEFAULT_PATH);
     let mut socket = PathBuf::from(rvn::daemon::SOCKET_PATH);
     let mut group = Some(rvn::daemon::DEFAULT_GROUP.to_string());
-    let mut rvn_binary = PathBuf::from("/usr/bin/rvn");
+    let mut rvn_binary = sibling_rvn(std::env::current_exe().ok());
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -90,4 +90,41 @@ fn main() {
         }
     };
     rvn::daemon::serve(config, listener);
+}
+
+/// The rvn installed beside this rvnd, falling back to `/usr/bin/rvn`.
+///
+/// A fixed `/usr/bin/rvn` meant an rvnd installed to /usr/local by
+/// `imlazy install` still ran the packaged rvn, so every fix to the
+/// transaction code reached a terminal and never the Store. The two are
+/// built together and belong together.
+fn sibling_rvn(exe: Option<PathBuf>) -> PathBuf {
+    exe.and_then(|exe| exe.parent().map(|dir| dir.join("rvn")))
+        .filter(|rvn| rvn.is_file())
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/rvn"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rvnd_runs_the_rvn_beside_it() {
+        let dir = std::env::temp_dir().join("rvnd-sibling");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("rvn"), b"").unwrap();
+        assert_eq!(sibling_rvn(Some(dir.join("rvnd"))), dir.join("rvn"));
+    }
+
+    #[test]
+    fn without_a_sibling_it_falls_back_to_the_packaged_rvn() {
+        let dir = std::env::temp_dir().join("rvnd-no-sibling");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            sibling_rvn(Some(dir.join("rvnd"))),
+            PathBuf::from("/usr/bin/rvn")
+        );
+        assert_eq!(sibling_rvn(None), PathBuf::from("/usr/bin/rvn"));
+    }
 }
