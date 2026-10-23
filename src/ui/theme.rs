@@ -94,9 +94,7 @@ impl Style {
         let interactive = std::io::stderr().is_terminal();
         let term = std::env::var("TERM").unwrap_or_default();
 
-        let color = interactive
-            && std::env::var_os("NO_COLOR").is_none()
-            && term != "dumb";
+        let color = interactive && std::env::var_os("NO_COLOR").is_none() && term != "dumb";
 
         // Assume UTF-8 output unless the locale clearly says otherwise.
         let lang = std::env::var("LC_ALL")

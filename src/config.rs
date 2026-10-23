@@ -467,7 +467,10 @@ mod tests {
         assert_eq!(p.root, PathBuf::from("/home/x/.local/share/rvn/root"));
         assert_eq!(p.db, PathBuf::from("/home/x/.local/share/rvn/db"));
         assert_eq!(p.cache, PathBuf::from("/home/x/.cache/rvn/pkg"));
-        assert_eq!(p.bin_dir(), PathBuf::from("/home/x/.local/share/rvn/root/usr/bin"));
+        assert_eq!(
+            p.bin_dir(),
+            PathBuf::from("/home/x/.local/share/rvn/root/usr/bin")
+        );
         unsafe {
             std::env::set_var("XDG_DATA_HOME", "/data");
             std::env::set_var("XDG_CACHE_HOME", "/cache");
@@ -485,7 +488,11 @@ mod tests {
     fn use_prefix_redirects_every_written_path_and_keeps_repos() {
         let dir = std::env::temp_dir().join(format!("rvn-prefix-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
-        let prefix = UserPrefix { root: dir.join("root"), db: dir.join("db"), cache: dir.join("pkg") };
+        let prefix = UserPrefix {
+            root: dir.join("root"),
+            db: dir.join("db"),
+            cache: dir.join("pkg"),
+        };
         // A system sync directory with one database, and a cache home of
         // our own so the per-user copy lands in the temp dir.
         let system_sync = dir.join("system-sync");
@@ -496,17 +503,40 @@ mod tests {
         }
         let mut cfg = Config::default();
         cfg.sync_dir_override = Some(system_sync.clone());
-        cfg.repos.push(Repo { name: "extra".into(), servers: vec!["https://mirror/extra".into()], siglevel: SigLevel::default_level() });
+        cfg.repos.push(Repo {
+            name: "extra".into(),
+            servers: vec!["https://mirror/extra".into()],
+            siglevel: SigLevel::default_level(),
+        });
         cfg.use_prefix(&prefix).unwrap();
         assert_eq!(cfg.root_dir, prefix.root);
         assert_eq!(cfg.db_path, prefix.db);
         assert_eq!(cfg.cache_dirs, vec![prefix.cache.clone()]);
-        assert_eq!(cfg.repos.len(), 1, "repositories come from the system config");
-        assert!(prefix.db.join("local").is_dir(), "the local db dir exists for the first install");
-        assert_eq!(cfg.gpg_dir, PathBuf::from("/etc/pacman.d/gnupg"), "the keyring is the system one");
+        assert_eq!(
+            cfg.repos.len(),
+            1,
+            "repositories come from the system config"
+        );
+        assert!(
+            prefix.db.join("local").is_dir(),
+            "the local db dir exists for the first install"
+        );
+        assert_eq!(
+            cfg.gpg_dir,
+            PathBuf::from("/etc/pacman.d/gnupg"),
+            "the keyring is the system one"
+        );
         let user_sync = dir.join("cache/rvn/sync");
-        assert_eq!(cfg.sync_db_path(), user_sync, "databases are read from the per-user copy");
-        assert_eq!(std::fs::read(user_sync.join("extra.db")).unwrap(), b"not really a db", "seeded from the system copy");
+        assert_eq!(
+            cfg.sync_db_path(),
+            user_sync,
+            "databases are read from the per-user copy"
+        );
+        assert_eq!(
+            std::fs::read(user_sync.join("extra.db")).unwrap(),
+            b"not really a db",
+            "seeded from the system copy"
+        );
         unsafe {
             std::env::remove_var("XDG_CACHE_HOME");
         }
@@ -595,7 +625,10 @@ mod tests {
         );
         let conf = write_temp(
             "with-included-repos.conf",
-            &format!("[options]\nArchitecture = x86_64\n\nInclude = {}\n", extra.display()),
+            &format!(
+                "[options]\nArchitecture = x86_64\n\nInclude = {}\n",
+                extra.display()
+            ),
         );
 
         let cfg = Config::load(&conf).unwrap();
@@ -662,7 +695,10 @@ mod tests {
         );
         // The repository must survive with the servers it does declare.
         let cfg = Config::load(&conf).unwrap();
-        assert_eq!(cfg.repo("core").unwrap().servers, vec!["https://fallback/core"]);
+        assert_eq!(
+            cfg.repo("core").unwrap().servers,
+            vec!["https://fallback/core"]
+        );
     }
 
     #[test]

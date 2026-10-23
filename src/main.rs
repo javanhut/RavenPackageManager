@@ -477,7 +477,7 @@ fn config_paths_arg() -> Arg {
 ///     takes, through `rvn --json`, exactly as Raven Store takes it for an
 ///     install.
 fn service_command(matches: &ArgMatches, action: &str, name: &str) -> Result<(), String> {
-    use rvn::daemon::{Reach, Replay, ServiceAction, reach, request, SOCKET_PATH};
+    use rvn::daemon::{Reach, Replay, SOCKET_PATH, ServiceAction, reach, request};
 
     let json = matches.get_flag("json");
 
@@ -500,7 +500,10 @@ fn service_command(matches: &ArgMatches, action: &str, name: &str) -> Result<(),
             )
         })?;
         if json {
-            Ui::json().emit("service", serde_json::json!({ "service": name, "status": text }));
+            Ui::json().emit(
+                "service",
+                serde_json::json!({ "service": name, "status": text }),
+            );
         } else {
             print!("{text}");
         }
@@ -584,8 +587,12 @@ fn service_command(matches: &ArgMatches, action: &str, name: &str) -> Result<(),
 /// here. `--yes` skips the first phase; `--dry-run` skips the second. In
 /// `--json` mode the events are relayed verbatim and there is one phase, as
 /// there always was for a front-end.
-fn via_daemon(matches: &ArgMatches, sub: &ArgMatches, mut req: rvn::daemon::Request) -> Option<Result<(), String>> {
-    use rvn::daemon::{Reach, reach, request, Replay, SOCKET_PATH};
+fn via_daemon(
+    matches: &ArgMatches,
+    sub: &ArgMatches,
+    mut req: rvn::daemon::Request,
+) -> Option<Result<(), String>> {
+    use rvn::daemon::{Reach, Replay, SOCKET_PATH, reach, request};
 
     if ops::is_root() || matches.get_flag("user") {
         return None;
@@ -699,9 +706,10 @@ fn build_context(matches: &ArgMatches, sub: &ArgMatches) -> Result<Context, Stri
         // directories for everything written.
         let mut config = rvn::config::Config::load(&config_path)
             .map_err(|e| format!("{}: {e}", config_path.display()))?;
-        let prefix = rvn::config::UserPrefix::from_env()
-            .ok_or("--user needs HOME to be set")?;
-        config.use_prefix(&prefix).map_err(|e| format!("cannot create the user prefix: {e}"))?;
+        let prefix = rvn::config::UserPrefix::from_env().ok_or("--user needs HOME to be set")?;
+        config
+            .use_prefix(&prefix)
+            .map_err(|e| format!("cannot create the user prefix: {e}"))?;
         let mut ctx = Context::from_config(config, ui);
         ctx.user_prefix = Some(prefix);
         ctx
@@ -777,7 +785,8 @@ fn main() -> ExitCode {
 
             // Offering the results as a numbered menu turns a search into an
             // install without retyping a package name.
-            let selectable = ctx.ui.style.interactive && !ctx.assume_yes && !sub.get_flag("no-select");
+            let selectable =
+                ctx.ui.style.interactive && !ctx.assume_yes && !sub.get_flag("no-select");
             ops::search::print_numbered(&ctx, &hits, limit, selectable);
 
             if !selectable {
@@ -836,8 +845,10 @@ fn main() -> ExitCode {
                     None => missing.push(name),
                 }
             }
-            ctx.ui
-                .emit("packages", serde_json::json!({ "packages": found, "missing": missing }));
+            ctx.ui.emit(
+                "packages",
+                serde_json::json!({ "packages": found, "missing": missing }),
+            );
             if !missing.is_empty() {
                 return Err(format!("no package named {}", missing.join(", ")));
             }
@@ -862,7 +873,8 @@ fn main() -> ExitCode {
                         v
                     })
                     .collect();
-                ctx.ui.emit("installed", serde_json::json!({ "packages": installed }));
+                ctx.ui
+                    .emit("installed", serde_json::json!({ "packages": installed }));
                 return Ok(());
             }
             let count = ops::query::list(&ctx, filter)?;

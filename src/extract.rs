@@ -15,13 +15,7 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 /// Archive members that are pacman metadata rather than installed files.
-const METADATA: &[&str] = &[
-    ".PKGINFO",
-    ".MTREE",
-    ".INSTALL",
-    ".BUILDINFO",
-    ".CHANGELOG",
-];
+const METADATA: &[&str] = &[".PKGINFO", ".MTREE", ".INSTALL", ".BUILDINFO", ".CHANGELOG"];
 
 #[derive(Debug)]
 pub enum ExtractError {
@@ -385,16 +379,10 @@ pub fn manifest(path: &Path) -> Result<Manifest, ExtractError> {
                     let mut entry = entry;
                     if entry.read_to_string(&mut text).is_ok() {
                         manifest.pkginfo = parse_pkginfo(&text);
-                        manifest.backup = manifest
-                            .pkginfo
-                            .get("backup")
-                            .cloned()
-                            .unwrap_or_default();
-                        manifest.depends = manifest
-                            .pkginfo
-                            .get("depend")
-                            .cloned()
-                            .unwrap_or_default();
+                        manifest.backup =
+                            manifest.pkginfo.get("backup").cloned().unwrap_or_default();
+                        manifest.depends =
+                            manifest.pkginfo.get("depend").cloned().unwrap_or_default();
                     }
                 }
                 Some(".MTREE") => {
@@ -554,7 +542,11 @@ pub fn find_conflicts(
         // An empty directory can be swapped for the entry without losing
         // anything, so only a populated one is fatal. An unreadable directory
         // fails closed and counts as populated.
-        if std::fs::read_dir(&destination).map(|d| d.count()).unwrap_or(1) == 0 {
+        if std::fs::read_dir(&destination)
+            .map(|d| d.count())
+            .unwrap_or(1)
+            == 0
+        {
             // Empty, but not necessarily unowned. The local database spells a
             // directory with a trailing slash, so the plain lookup above --
             // keyed on the symlink's own spelling -- cannot see it, and
@@ -681,12 +673,7 @@ pub fn unpack(
 fn roll_back(mut created: Vec<Created>, foreign: &HashMap<String, String>) {
     // Files first, then directories from the deepest upward: a directory only
     // comes off once whatever this run put inside it is gone.
-    created.sort_by_key(|c| {
-        (
-            c.is_dir,
-            std::cmp::Reverse(c.absolute.components().count()),
-        )
-    });
+    created.sort_by_key(|c| (c.is_dir, std::cmp::Reverse(c.absolute.components().count())));
 
     for entry in created {
         // Belt and braces. A path another package owns is on disk already, so
@@ -812,7 +799,11 @@ fn extract_entries(
 
         if kind.is_dir() {
             create_dirs(&destination, root, created)?;
-            deferred_times.push((destination.clone(), entry.header().mtime().unwrap_or(0), true));
+            deferred_times.push((
+                destination.clone(),
+                entry.header().mtime().unwrap_or(0),
+                true,
+            ));
             // Recorded with a trailing slash, as pacman does, so removal can
             // prune directories a package created but never filled.
             installed.push(format!("{as_string}/"));
@@ -903,8 +894,7 @@ fn extract_entries(
                     // refused in both places rather than being skipped in one
                     // and rejected in the other.
                     let existing_dir = err.kind() == std::io::ErrorKind::AlreadyExists
-                        && std::fs::symlink_metadata(&link_path)
-                            .is_ok_and(|meta| meta.is_dir());
+                        && std::fs::symlink_metadata(&link_path).is_ok_and(|meta| meta.is_dir());
                     if existing_dir {
                         return Err(ExtractError::TypeConflict {
                             path: link_name.clone(),
@@ -1065,8 +1055,8 @@ fn extract_entries(
         // listed as `backup` is the administrator's, and a package shipping
         // it as a hard link this time round does not change that. Rare, but
         // the cost of getting it wrong is the same edits.
-        let spare = backup.contains(as_string.as_str())
-            && std::fs::symlink_metadata(&destination).is_ok();
+        let spare =
+            backup.contains(as_string.as_str()) && std::fs::symlink_metadata(&destination).is_ok();
         let (link_path, link_name) = if spare {
             (pacnew_path(&destination), format!("{as_string}.pacnew"))
         } else {
@@ -1248,7 +1238,11 @@ mod tests {
         write(&mut header, 100, b"0000644\0");
         write(&mut header, 108, b"0000000\0");
         write(&mut header, 116, b"0000000\0");
-        write(&mut header, 124, format!("{:011o}\0", body.len()).as_bytes());
+        write(
+            &mut header,
+            124,
+            format!("{:011o}\0", body.len()).as_bytes(),
+        );
         write(&mut header, 136, b"00000000000\0");
         header[156] = b'0'; // Regular file.
         write(&mut header, 257, b"ustar\0");
@@ -1313,7 +1307,10 @@ mod tests {
         let root = temp_dir("unpack");
 
         let mut seen = Vec::new();
-        let files = unpack(&archive, &root, &unowned(), &[], &mut Vec::new(), |f| seen.push(f.to_string())).unwrap();
+        let files = unpack(&archive, &root, &unowned(), &[], &mut Vec::new(), |f| {
+            seen.push(f.to_string())
+        })
+        .unwrap();
 
         assert_eq!(files.len(), 2);
         assert_eq!(seen.len(), 2);
@@ -1382,7 +1379,9 @@ mod tests {
         dir_header.set_mode(0o755);
         dir_header.set_mtime(STAMP);
         dir_header.set_cksum();
-        builder.append_data(&mut dir_header, "usr/lib/", &[][..]).unwrap();
+        builder
+            .append_data(&mut dir_header, "usr/lib/", &[][..])
+            .unwrap();
 
         let mut link_header = tar::Header::new_gnu();
         link_header.set_entry_type(tar::EntryType::Symlink);
@@ -1416,12 +1415,7 @@ mod tests {
     #[test]
     fn recreates_symlinks_verbatim() {
         let mut builder = tar::Builder::new(Vec::new());
-        link_entry(
-            &mut builder,
-            "usr/bin/sh",
-            "bash",
-            tar::EntryType::Symlink,
-        );
+        link_entry(&mut builder, "usr/bin/sh", "bash", tar::EntryType::Symlink);
         let archive = write_tar("symlink", &builder.into_inner().unwrap());
         let root = temp_dir("symlink");
 
@@ -1472,7 +1466,11 @@ mod tests {
         assert!(rendered.contains("a directory with 1 entry"), "{rendered}");
 
         // The directory is untouched, and the rollback took the rest with it.
-        assert!(std::fs::symlink_metadata(root.join("bin")).unwrap().is_dir());
+        assert!(
+            std::fs::symlink_metadata(root.join("bin"))
+                .unwrap()
+                .is_dir()
+        );
         assert!(root.join("bin/sh").exists());
         assert!(
             !root.join("etc/issue").exists(),
@@ -1579,10 +1577,7 @@ mod tests {
                        license = MIT\n\
                        depend = glibc\n\
                        depend = pcre2\n";
-        let tar = build_tar(&[
-            (".PKGINFO", pkginfo, false),
-            ("usr/bin/demo", "x", false),
-        ]);
+        let tar = build_tar(&[(".PKGINFO", pkginfo, false), ("usr/bin/demo", "x", false)]);
         let path = write_tar("pkginfo-full", &tar);
         let m = manifest(&path).unwrap();
 
@@ -1641,8 +1636,7 @@ mod tests {
                 enc.finish().unwrap();
             }
             "gz" => {
-                let mut enc =
-                    flate2::write::GzEncoder::new(out, flate2::Compression::fast());
+                let mut enc = flate2::write::GzEncoder::new(out, flate2::Compression::fast());
                 std::io::Write::write_all(&mut enc, tar).unwrap();
                 enc.finish().unwrap();
             }
@@ -1665,8 +1659,7 @@ mod tests {
 
         for ext in ["xz", "gz", "bz2"] {
             let path = write_compressed(&format!("fmt-{ext}"), ext, &tar);
-            let m = manifest(&path)
-                .unwrap_or_else(|e| panic!("{ext} manifest failed: {e}"));
+            let m = manifest(&path).unwrap_or_else(|e| panic!("{ext} manifest failed: {e}"));
             assert_eq!(m.files, vec!["usr/bin/demo"], "format {ext}");
 
             let root = temp_dir(&format!("fmt-{ext}"));
@@ -1778,9 +1771,16 @@ mod tests {
         );
 
         // Nothing may have been written, moved or removed by looking.
-        assert!(std::fs::symlink_metadata(root.join("bin")).unwrap().is_dir());
+        assert!(
+            std::fs::symlink_metadata(root.join("bin"))
+                .unwrap()
+                .is_dir()
+        );
         assert_eq!(std::fs::read_to_string(root.join("bin/sh")).unwrap(), "#!");
-        assert!(!root.join("etc").exists(), "the install must not have begun");
+        assert!(
+            !root.join("etc").exists(),
+            "the install must not have begun"
+        );
     }
 
     #[test]
@@ -1843,7 +1843,10 @@ mod tests {
             inode,
             "an unchanged symlink must not be recreated"
         );
-        assert_eq!(std::fs::read_link(&link).unwrap(), PathBuf::from("libfoo.so.1"));
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from("libfoo.so.1")
+        );
         assert_eq!(
             std::fs::read_to_string(root.join("usr/bin/demo")).unwrap(),
             "#!/bin/sh\n"
@@ -1865,11 +1868,17 @@ mod tests {
         std::fs::write(root.join("usr/share/doc/README"), b"docs").unwrap();
 
         let err = unpack(&archive, &root, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap_err();
-        assert!(matches!(err, ExtractError::TypeConflict { .. }), "got {err:?}");
+        assert!(
+            matches!(err, ExtractError::TypeConflict { .. }),
+            "got {err:?}"
+        );
 
         // What this run wrote is gone, directories included.
         assert!(!root.join("usr/bin/demo").exists());
-        assert!(!root.join("usr/bin").exists(), "a created directory must be pruned");
+        assert!(
+            !root.join("usr/bin").exists(),
+            "a created directory must be pruned"
+        );
         // What was already there is untouched: rvn keeps no copy of it, so
         // undoing must never mean deleting it.
         assert!(root.join("usr").is_dir());
@@ -1937,16 +1946,30 @@ mod tests {
         std::os::unix::fs::symlink("nowhere", dangling.join("usr")).unwrap();
         let archive = write_tar("io-context-dangling", &build_tar(&[("usr/", "", true)]));
 
-        let err = unpack(&archive, &dangling, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap_err();
+        let err = unpack(
+            &archive,
+            &dangling,
+            &unowned(),
+            &[],
+            &mut Vec::new(),
+            |_| {},
+        )
+        .unwrap_err();
         let message = err.to_string();
         assert!(matches!(err, ExtractError::IoAt { .. }), "got {err:?}");
         assert!(message.starts_with("creating directory "), "{message}");
-        assert!(message.ends_with("/usr: File exists (os error 17)"), "{message}");
+        assert!(
+            message.ends_with("/usr: File exists (os error 17)"),
+            "{message}"
+        );
 
         // A plain file where a parent directory belongs reports the same way.
         let blocked = temp_dir("io-context-file");
         std::fs::write(blocked.join("usr"), b"not a directory").unwrap();
-        let archive = write_tar("io-context-file", &build_tar(&[("usr/bin/demo", "x", false)]));
+        let archive = write_tar(
+            "io-context-file",
+            &build_tar(&[("usr/bin/demo", "x", false)]),
+        );
 
         let err = unpack(&archive, &blocked, &unowned(), &[], &mut Vec::new(), |_| {}).unwrap_err();
         let message = err.to_string();
@@ -2099,7 +2122,12 @@ mod tests {
     #[test]
     fn an_empty_directory_owned_by_another_package_is_a_conflict() {
         let mut builder = tar::Builder::new(Vec::new());
-        link_entry(&mut builder, "var/empty", "usr/empty", tar::EntryType::Symlink);
+        link_entry(
+            &mut builder,
+            "var/empty",
+            "usr/empty",
+            tar::EntryType::Symlink,
+        );
         let archive = write_tar("steal-dir", &builder.into_inner().unwrap());
         let root = temp_dir("steal-dir");
         std::fs::create_dir_all(root.join("var/empty")).unwrap();
@@ -2128,7 +2156,12 @@ mod tests {
     #[test]
     fn an_upgrade_may_turn_its_own_directory_into_a_symlink() {
         let mut builder = tar::Builder::new(Vec::new());
-        link_entry(&mut builder, "usr/share/foo", "bar", tar::EntryType::Symlink);
+        link_entry(
+            &mut builder,
+            "usr/share/foo",
+            "bar",
+            tar::EntryType::Symlink,
+        );
         let archive = write_tar("selfconv", &builder.into_inner().unwrap());
         let root = temp_dir("selfconv");
         std::fs::create_dir_all(root.join("usr/share/foo")).unwrap();
@@ -2142,7 +2175,10 @@ mod tests {
             ..Default::default()
         };
         local
-            .register(&foo, &["usr/share/foo/".into(), "usr/share/foo/data".into()])
+            .register(
+                &foo,
+                &["usr/share/foo/".into(), "usr/share/foo/data".into()],
+            )
             .unwrap();
 
         let manifest = manifest(&archive).unwrap();
@@ -2188,7 +2224,9 @@ mod tests {
         header.set_size(0);
         header.set_mode(0o755);
         header.set_cksum();
-        builder.append_data(&mut header, "opt/thing/", &[][..]).unwrap();
+        builder
+            .append_data(&mut header, "opt/thing/", &[][..])
+            .unwrap();
         let archive = write_tar("direntry", &builder.into_inner().unwrap());
         let root = temp_dir("direntry");
         std::fs::create_dir_all(root.join("opt")).unwrap();
@@ -2197,9 +2235,11 @@ mod tests {
         let manifest = manifest(&archive).unwrap();
         let local = LocalDb::load(&temp_dir("direntry-db"));
         let problems = find_conflicts(&manifest, &local, &root, &[]).unwrap();
-        assert!(!problems.is_empty(), "a directory over a file must be caught");
+        assert!(
+            !problems.is_empty(),
+            "a directory over a file must be caught"
+        );
     }
-
 
     /// The incident this guards: Arch's `filesystem` package ships /etc/passwd
     /// (one root line) marked `backup`, and rvn extracted straight over the
@@ -2211,7 +2251,8 @@ mod tests {
         let path = write_tar("backup-clobber", &tar);
         let root = temp_dir("backup-clobber");
         std::fs::create_dir_all(root.join("etc")).unwrap();
-        let live = "root:x:0:0:root:/root:/bin/bash\njavanstorm:x:1000:1000::/home/javanstorm:/bin/bash\n";
+        let live =
+            "root:x:0:0:root:/root:/bin/bash\njavanstorm:x:1000:1000::/home/javanstorm:/bin/bash\n";
         std::fs::write(root.join("etc/passwd"), live).unwrap();
 
         let mut pacnew = Vec::new();
@@ -2253,7 +2294,15 @@ mod tests {
         std::fs::write(root.join("etc/hosts"), "127.0.0.1 localhost\n").unwrap();
 
         let mut pacnew = Vec::new();
-        unpack(&path, &root, &unowned(), &["etc/hosts".to_string()], &mut pacnew, |_| {}).unwrap();
+        unpack(
+            &path,
+            &root,
+            &unowned(),
+            &["etc/hosts".to_string()],
+            &mut pacnew,
+            |_| {},
+        )
+        .unwrap();
 
         assert!(pacnew.is_empty());
         assert!(!root.join("etc/hosts.pacnew").exists());
@@ -2267,9 +2316,20 @@ mod tests {
         let root = temp_dir("backup-absent");
 
         let mut pacnew = Vec::new();
-        unpack(&path, &root, &unowned(), &["etc/fstab".to_string()], &mut pacnew, |_| {}).unwrap();
+        unpack(
+            &path,
+            &root,
+            &unowned(),
+            &["etc/fstab".to_string()],
+            &mut pacnew,
+            |_| {},
+        )
+        .unwrap();
 
-        assert_eq!(std::fs::read_to_string(root.join("etc/fstab")).unwrap(), "# fstab\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("etc/fstab")).unwrap(),
+            "# fstab\n"
+        );
         assert!(pacnew.is_empty());
     }
 
@@ -2290,8 +2350,15 @@ mod tests {
         std::fs::write(root.join("usr/share/doc/README"), "x").unwrap();
 
         let mut pacnew = Vec::new();
-        unpack(&path, &root, &unowned(), &["etc/passwd".to_string()], &mut pacnew, |_| {})
-            .unwrap_err();
+        unpack(
+            &path,
+            &root,
+            &unowned(),
+            &["etc/passwd".to_string()],
+            &mut pacnew,
+            |_| {},
+        )
+        .unwrap_err();
 
         assert!(
             !root.join("etc/passwd.pacnew").exists(),
@@ -2322,7 +2389,11 @@ mod tests {
         header.set_mode(0o644);
         header.set_cksum();
         builder
-            .append_data(&mut header, "usr/share/foo/foo.conf", &b"shipped default\n"[..])
+            .append_data(
+                &mut header,
+                "usr/share/foo/foo.conf",
+                &b"shipped default\n"[..],
+            )
             .unwrap();
         link_entry(
             &mut builder,
@@ -2377,7 +2448,11 @@ mod tests {
         header.set_mode(0o644);
         header.set_cksum();
         builder
-            .append_data(&mut header, "usr/share/foo/foo.conf", &b"shipped default\n"[..])
+            .append_data(
+                &mut header,
+                "usr/share/foo/foo.conf",
+                &b"shipped default\n"[..],
+            )
             .unwrap();
         link_entry(
             &mut builder,
@@ -2420,7 +2495,11 @@ mod tests {
         header.set_mode(0o644);
         header.set_cksum();
         builder
-            .append_data(&mut header, "usr/share/foo/foo.conf", &b"shipped default\n"[..])
+            .append_data(
+                &mut header,
+                "usr/share/foo/foo.conf",
+                &b"shipped default\n"[..],
+            )
             .unwrap();
         link_entry(
             &mut builder,

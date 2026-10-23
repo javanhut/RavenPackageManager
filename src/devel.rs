@@ -84,7 +84,10 @@ impl Registry {
 /// bare URL is useful for querying the remote.
 pub fn clean_source_url(source: &str) -> Option<String> {
     // Drop a `name::` prefix.
-    let source = source.split_once("::").map(|(_, rest)| rest).unwrap_or(source);
+    let source = source
+        .split_once("::")
+        .map(|(_, rest)| rest)
+        .unwrap_or(source);
 
     // Only VCS sources move under us; a tarball is pinned by its checksum.
     let (vcs, rest) = source.split_once('+')?;
@@ -121,7 +124,10 @@ fn is_fetchable_url(url: &str) -> bool {
         "https://", "http://", "git://", "ssh://", "ftps://", "ftp://",
     ];
 
-    !url.contains("::") && FETCH_ONLY_SCHEMES.iter().any(|scheme| url.starts_with(scheme))
+    !url.contains("::")
+        && FETCH_ONLY_SCHEMES
+            .iter()
+            .any(|scheme| url.starts_with(scheme))
 }
 
 /// The first VCS source in a `.SRCINFO` source list.
@@ -443,7 +449,11 @@ mod tests {
         assert_eq!(reloaded.names(), vec!["demo-git"]);
 
         // A missing registry is empty rather than an error.
-        assert!(Registry::load(Path::new("/nonexistent/rvn")).names().is_empty());
+        assert!(
+            Registry::load(Path::new("/nonexistent/rvn"))
+                .names()
+                .is_empty()
+        );
     }
 
     #[test]

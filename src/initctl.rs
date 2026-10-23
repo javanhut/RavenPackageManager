@@ -185,7 +185,10 @@ mod tests {
 
     /// Stands in for init: reads the one request line, writes `reply`, and
     /// closes -- which is what ends the client's read.
-    fn fake_init(dir: &Path, reply: &'static str) -> (std::path::PathBuf, std::thread::JoinHandle<String>) {
+    fn fake_init(
+        dir: &Path,
+        reply: &'static str,
+    ) -> (std::path::PathBuf, std::thread::JoinHandle<String>) {
         let socket = dir.join("init.sock");
         let listener = UnixListener::bind(&socket).expect("bind");
         let handle = std::thread::spawn(move || {

@@ -90,7 +90,10 @@ fn recorded_origin(fields: &HashMap<String, Vec<String>>) -> Option<Origin> {
 }
 
 /// Builds a [`Package`] from a parsed desc record.
-pub fn package_from_fields(fields: &HashMap<String, Vec<String>>, origin: Origin) -> Option<Package> {
+pub fn package_from_fields(
+    fields: &HashMap<String, Vec<String>>,
+    origin: Origin,
+) -> Option<Package> {
     let name = one(fields, "NAME")?;
     let version = one(fields, "VERSION").unwrap_or_default();
 
@@ -301,7 +304,9 @@ go-compiler=1.22.0
         assert!(is_safe_archive_name("go-2:1.22.0-1-x86_64.pkg.tar.zst"));
         // A name with dots and a dash in it is ordinary; only separators are
         // the problem.
-        assert!(is_safe_archive_name("lib32-glibc-2.39-1-x86_64.pkg.tar.zst"));
+        assert!(is_safe_archive_name(
+            "lib32-glibc-2.39-1-x86_64.pkg.tar.zst"
+        ));
         let pkg = parse_package(SAMPLE, Origin::Repo("extra".into())).unwrap();
         assert_eq!(
             pkg.filename.as_deref(),

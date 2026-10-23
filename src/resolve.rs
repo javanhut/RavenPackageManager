@@ -1203,9 +1203,7 @@ mod tests {
     /// Marks the makepkg toolchain as present, for tests about something else.
     fn toolchain_installed(local: &mut LocalDb) {
         for tool in AUR_TOOLCHAIN {
-            local
-                .packages
-                .insert((*tool).into(), pkg(tool, "1-1", &[]));
+            local.packages.insert((*tool).into(), pkg(tool, "1-1", &[]));
         }
     }
 
@@ -1232,7 +1230,10 @@ mod tests {
         let order = names(&plan);
         assert_eq!(order.last().unwrap(), "brave-bin");
         for tool in AUR_TOOLCHAIN {
-            assert!(order.contains(&tool.to_string()), "{tool} not planned: {order:?}");
+            assert!(
+                order.contains(&tool.to_string()),
+                "{tool} not planned: {order:?}"
+            );
             let resolved = plan
                 .install
                 .iter()
@@ -1259,8 +1260,7 @@ mod tests {
             pkg("base-devel", "1-2", &[]),
             pkg("git", "2.55.0-1", &[]),
         ]);
-        let plan =
-            Resolver::new(&dbs, &empty_local(), &FakeAur(vec![])).resolve(&["go".into()]);
+        let plan = Resolver::new(&dbs, &empty_local(), &FakeAur(vec![])).resolve(&["go".into()]);
         assert_eq!(names(&plan), vec!["go"]);
     }
 }

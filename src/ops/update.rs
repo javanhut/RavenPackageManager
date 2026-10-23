@@ -37,7 +37,8 @@ pub fn run(ctx: &mut Context, targets: &[String], refresh: bool) -> Result<Outco
         // it ran without sudo. Raven Settings and Raven Store both read
         // through here, so this is what keeps them agreeing.
         if ctx.dry_run && sync::prefer_fresher_copy(ctx) {
-            ctx.ui.detail("reading the databases last synced without sudo");
+            ctx.ui
+                .detail("reading the databases last synced without sudo");
         }
         if sync::needs_refresh(ctx) {
             ctx.ui
@@ -75,7 +76,10 @@ pub fn run(ctx: &mut Context, targets: &[String], refresh: bool) -> Result<Outco
             .collect();
 
         if !foreign.is_empty() && !ctx.repo_only {
-            spinner.set_message(&format!("querying the AUR about {} packages", foreign.len()));
+            spinner.set_message(&format!(
+                "querying the AUR about {} packages",
+                foreign.len()
+            ));
             if let Err(e) = ctx.aur.prefetch(&foreign) {
                 ctx.ui.warn(&format!("AUR query failed: {e}"));
             }
@@ -215,7 +219,11 @@ pub fn run(ctx: &mut Context, targets: &[String], refresh: bool) -> Result<Outco
     ctx.ui.ok(&format!(
         "{} package{} updated",
         ctx.ui.style.bold(&outcome.installed.len().to_string()),
-        if outcome.installed.len() == 1 { "" } else { "s" }
+        if outcome.installed.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
     ));
 
     Ok(Outcome {
@@ -241,7 +249,11 @@ fn show_candidates(ctx: &Context, applicable: &[Candidate], downgrades: &[Candid
             c.origin.label(),
         );
         let mut line = if c.kind == Kind::Devel {
-            format!("{origin}/{} {}", s.bold(&c.name), s.dim(&c.installed_version))
+            format!(
+                "{origin}/{} {}",
+                s.bold(&c.name),
+                s.dim(&c.installed_version)
+            )
         } else {
             format!(
                 "{origin}/{} {} {} {}",
@@ -292,7 +304,11 @@ fn show_candidates(ctx: &Context, applicable: &[Candidate], downgrades: &[Candid
         ctx.ui.warn(&format!(
             "{} installed package{} newer than the repositories carry (skipped):",
             downgrades.len(),
-            if downgrades.len() == 1 { " is" } else { "s are" }
+            if downgrades.len() == 1 {
+                " is"
+            } else {
+                "s are"
+            }
         ));
         ctx.ui
             .tree(&downgrades.iter().map(render).collect::<Vec<_>>());

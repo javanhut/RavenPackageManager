@@ -426,9 +426,7 @@ fn waited(seconds: Option<u64>) -> String {
     let Some(seconds) = seconds else {
         return "waiting".to_string();
     };
-    let plural = |n: u64, unit: &str| {
-        format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
-    };
+    let plural = |n: u64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
     match seconds {
         s if s < 60 => "just now".to_string(),
         s if s < 3600 => plural(s / 60, "minute"),
@@ -650,8 +648,12 @@ fn accept(ctx: &mut Context, file: &Pending) -> Result<Settled, String> {
     // file, on the same filesystem, so this either happens completely or does
     // not happen at all. Its mode and ownership come across with it, which is
     // the point -- taking the package's version means taking all of it.
-    std::fs::rename(&file.pacnew, &file.live)
-        .map_err(|e| format!("{}: could not install the package's version: {e}", file.path))?;
+    std::fs::rename(&file.pacnew, &file.live).map_err(|e| {
+        format!(
+            "{}: could not install the package's version: {e}",
+            file.path
+        )
+    })?;
 
     match &saved {
         Some(saved) => ctx.ui.ok(&format!(
@@ -711,8 +713,10 @@ fn merge(ctx: &mut Context, file: &Pending) -> Result<Settled, String> {
     let saved = save_original(&file.live)
         .map_err(|e| format!("{}: could not save the current file: {e}", file.path))?;
     if let Some(saved) = &saved {
-        ctx.ui
-            .info(&format!("the file as it stands is saved at {}", saved.display()));
+        ctx.ui.info(&format!(
+            "the file as it stands is saved at {}",
+            saved.display()
+        ));
     }
 
     let mut command = editor(&chosen_editor(), &file.live, &file.pacnew);
@@ -761,7 +765,11 @@ fn chosen_editor() -> String {
     std::env::var("VISUAL")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .or_else(|| std::env::var("EDITOR").ok().filter(|v| !v.trim().is_empty()))
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
         .unwrap_or_else(|| "vimdiff".to_string())
 }
 
@@ -932,10 +940,7 @@ mod tests {
         let root = temp_root("outside-etc");
         waiting(&root, "usr/share/demo/demo.conf", "mine\n", "theirs\n");
 
-        let owners = HashMap::from([(
-            "usr/share/demo/demo.conf".to_string(),
-            "demo".to_string(),
-        )]);
+        let owners = HashMap::from([("usr/share/demo/demo.conf".to_string(), "demo".to_string())]);
         let found = discover(&root, &owners);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].package.as_deref(), Some("demo"));
@@ -983,7 +988,11 @@ mod tests {
     #[test]
     fn a_file_that_does_not_exist_yet_has_nothing_to_save() {
         let root = temp_root("save-absent");
-        assert!(save_original(&root.join("etc/absent.conf")).unwrap().is_none());
+        assert!(
+            save_original(&root.join("etc/absent.conf"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     // The four files the account database lives in, plus the two that record
@@ -1040,10 +1049,7 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
             .collect();
-        assert_eq!(
-            args,
-            vec!["--wait", "/etc/sudoers", "/etc/sudoers.pacnew"]
-        );
+        assert_eq!(args, vec!["--wait", "/etc/sudoers", "/etc/sudoers.pacnew"]);
     }
 
     // Both files, in that order, so a side-by-side editor puts what is on

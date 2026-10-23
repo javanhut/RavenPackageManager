@@ -177,7 +177,10 @@ impl Spinner {
             );
         }
         let glyph = self.style.paint(Color::Green, self.style.glyphs.ok);
-        let took = self.style.dim(&format!("({})", super::theme::duration(self.started.elapsed())));
+        let took = self.style.dim(&format!(
+            "({})",
+            super::theme::duration(self.started.elapsed())
+        ));
         let mut err = std::io::stderr();
         let _ = writeln!(err, "  {glyph}  {message} {took}");
     }

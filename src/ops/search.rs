@@ -186,7 +186,11 @@ pub fn parse_selection(input: &str, count: usize) -> Vec<usize> {
                 let (low, high) = if from <= to { (from, to) } else { (to, from) };
                 (low..=high).collect()
             }
-            None => token.trim().parse::<usize>().map(|n| vec![n]).unwrap_or_default(),
+            None => token
+                .trim()
+                .parse::<usize>()
+                .map(|n| vec![n])
+                .unwrap_or_default(),
         }
     };
 
@@ -234,7 +238,11 @@ mod tests {
     fn exact_name_match_outranks_everything() {
         let exact = pkg("go", "the go compiler", Origin::Repo("extra".into()));
         let prefix = pkg("golang-tools", "tools", Origin::Repo("extra".into()));
-        let desc = pkg("vim", "editor with go support", Origin::Repo("extra".into()));
+        let desc = pkg(
+            "vim",
+            "editor with go support",
+            Origin::Repo("extra".into()),
+        );
 
         assert!(score(&exact, "go") < score(&prefix, "go"));
         assert!(score(&prefix, "go") < score(&desc, "go"));

@@ -40,12 +40,12 @@ const NEVER_REPLACED: &[&str] = &[
     "etc/subgid",
     "etc/sudoers",
 ];
+use crate::config::Level;
 use crate::resolve::{NoSource, Plan, Resolved, Resolver};
 use crate::scriptlet::{self, Hook};
 use crate::txhooks;
 use crate::ui::spinner::Spinner;
 use crate::ui::theme::{Color, bytes, bytes_signed};
-use crate::config::Level;
 use crate::verify::{self, Verified};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -100,12 +100,23 @@ struct Batch {
     /// Packages left out because of a file conflict, their own or one they
     /// depend on. The rest of the batch still went in.
     held_back: Vec<String>,
+    /// AUR packages whose build failed. Like a conflict, one bad PKGBUILD
+    /// stops that package and what needs it, not the rest of an update.
+    failed: Vec<String>,
+    /// Why the first package that was stopped was stopped, in the words a
+    /// single-package transaction has always failed with. The transaction
+    /// fails with it when nothing at all went in.
+    refusal: Option<String>,
 }
 
 impl Batch {
     fn absorb(&mut self, other: Batch) {
         self.installed.extend(other.installed);
         self.held_back.extend(other.held_back);
+        self.failed.extend(other.failed);
+        if self.refusal.is_none() {
+            self.refusal = other.refusal;
+        }
         self.stale_removed += other.stale_removed;
         self.stale_preserved.extend(other.stale_preserved);
         self.pacnew.extend(other.pacnew);
@@ -151,9 +162,7 @@ pub fn execute(ctx: &mut Context, targets: &[String]) -> Result<Outcome, String>
 
     // ---- resolve -------------------------------------------------------
     let plan = {
-        let spinner = ctx
-            .ui
-            .stage(&format!("resolving {}", targets.join(", ")));
+        let spinner = ctx.ui.stage(&format!("resolving {}", targets.join(", ")));
 
         let plan = if ctx.repo_only {
             Resolver::new(&ctx.sync, &ctx.local, &NoSource)
@@ -170,7 +179,10 @@ pub fn execute(ctx: &mut Context, targets: &[String]) -> Result<Outcome, String>
         };
 
         let deps = plan.install.len().saturating_sub(
-            plan.install.iter().filter(|r| r.reason.is_explicit()).count(),
+            plan.install
+                .iter()
+                .filter(|r| r.reason.is_explicit())
+                .count(),
         );
         spinner.succeed(&format!(
             "resolved {} package{}, {} dependenc{}",
@@ -192,7 +204,8 @@ pub fn execute(ctx: &mut Context, targets: &[String]) -> Result<Outcome, String>
 
     if plan.is_empty() {
         for name in &plan.already_satisfied {
-            ctx.ui.ok(&format!("{name} is already installed and current"));
+            ctx.ui
+                .ok(&format!("{name} is already installed and current"));
         }
         return Ok(Outcome {
             installed: Vec::new(),
@@ -365,7 +378,12 @@ pub fn execute(ctx: &mut Context, targets: &[String]) -> Result<Outcome, String>
         let pkg = &resolved.package;
         // Built against the version installed rather than the one it was
         // resolved against, it would be broken the moment it landed.
-        if let Some(held) = batch.held_back.iter().find(|h| needs(pkg, h, &plan)) {
+        if let Some(held) = batch
+            .held_back
+            .iter()
+            .chain(&batch.failed)
+            .find(|h| needs(pkg, h, &plan))
+        {
             ctx.ui.warn(&format!(
                 "{} needs {held}, which was held back, so it is not built",
                 pkg.name
@@ -383,7 +401,10 @@ pub fn execute(ctx: &mut Context, targets: &[String]) -> Result<Outcome, String>
             }
             Err(e) => {
                 spinner.fail(&format!("{} failed to build", pkg.name));
-                return Err(format!("{}: {e}", pkg.name));
+                ctx.ui.err(&format!("{}: {e}", pkg.name));
+                batch.failed.push(pkg.name.clone());
+                batch.refusal.get_or_insert(format!("{}: {e}", pkg.name));
+                continue;
             }
         };
 
@@ -410,14 +431,27 @@ pub fn execute(ctx: &mut Context, targets: &[String]) -> Result<Outcome, String>
         }
 
         if built.is_empty() {
-            return Err(format!(
+            let why = format!(
                 "{} built successfully but produced nothing matching the request",
                 pkg.name
-            ));
+            );
+            ctx.ui.err(&why);
+            batch.failed.push(pkg.name.clone());
+            batch.refusal.get_or_insert(why);
+            continue;
         }
 
         batch.absorb(install_archives(ctx, &plan, &built, &validations)?);
         built_archives.extend(built.into_iter().map(|(_, path)| path));
+    }
+
+    // Everything was stopped: fail the way a single-package transaction
+    // always has. Anything less than everything is reported in the summary
+    // and the rest of the transaction stands.
+    if batch.installed.is_empty()
+        && let Some(refusal) = batch.refusal.take()
+    {
+        return Err(refusal);
     }
 
     if batch.stale_removed > 0 {
@@ -533,6 +567,10 @@ pub fn execute(ctx: &mut Context, targets: &[String]) -> Result<Outcome, String>
             "held back by file conflicts: {}",
             batch.held_back.join(", ")
         ));
+    }
+    if !batch.failed.is_empty() {
+        ctx.ui
+            .warn(&format!("failed to build: {}", batch.failed.join(", ")));
     }
 
     // A .pacnew is the one thing a transaction leaves unfinished for a human,
@@ -713,6 +751,9 @@ pub fn install_from_cache(
     let validations = HashMap::from([(package.to_string(), validation)]);
     let archives = vec![(package.to_string(), archive.to_path_buf())];
     let batch = install_archives(ctx, &plan, &archives, &validations)?;
+    if let Some(refusal) = batch.refusal {
+        return Err(refusal);
+    }
 
     let after = txhooks::Transaction::new(
         operations,
@@ -1080,7 +1121,10 @@ fn review_build_files(ctx: &Context, name: &str, dir: &Path) -> Result<(), Strin
     ctx.ui
         .detail(&format!("build files: {}", pkgbuild.display()));
 
-    if !ctx.ui.confirm(&format!("review the PKGBUILD for {name}?"), false) {
+    if !ctx
+        .ui
+        .confirm(&format!("review the PKGBUILD for {name}?"), false)
+    {
         return Ok(());
     }
 
@@ -1100,7 +1144,8 @@ fn review_build_files(ctx: &Context, name: &str, dir: &Path) -> Result<(), Strin
     for candidate in [format!("{name}.install"), ".INSTALL".to_string()] {
         let path = dir.join(&candidate);
         if let Ok(text) = std::fs::read_to_string(&path) {
-            ctx.ui.warn(&format!("{name} ships an install scriptlet ({candidate}):"));
+            ctx.ui
+                .warn(&format!("{name} ships an install scriptlet ({candidate}):"));
             for line in text.lines() {
                 println!("    {line}");
             }
@@ -1206,10 +1251,8 @@ pub(crate) fn run_scriptlet(
         }
         scriptlet::Outcome::NotDefined => {}
         scriptlet::Outcome::Failed(message) => {
-            ctx.ui.warn(&format!(
-                "{package}: {} failed: {message}",
-                hook.function()
-            ));
+            ctx.ui
+                .warn(&format!("{package}: {} failed: {message}", hook.function()));
         }
     }
 }
@@ -1438,7 +1481,12 @@ fn install_archives(
         // Files owned by the version being upgraded are not in the way, and
         // neither are files owned by a package this one replaces: those are
         // handed over, and their old owner is retired once this one is in.
-        let mut exempt: Vec<&str> = ctx.local.get(name).map(|_| name.as_str()).into_iter().collect();
+        let mut exempt: Vec<&str> = ctx
+            .local
+            .get(name)
+            .map(|_| name.as_str())
+            .into_iter()
+            .collect();
         exempt.extend(
             plan.replacing
                 .iter()
@@ -1506,7 +1554,11 @@ fn install_archives(
             {
                 return Some((name.clone(), donor.clone()));
             }
-            let package = &plan.install.iter().find(|r| r.package.name == *name)?.package;
+            let package = &plan
+                .install
+                .iter()
+                .find(|r| r.package.name == *name)?
+                .package;
             held.iter()
                 .find(|h| needs(package, h, plan))
                 .map(|h| (name.clone(), h.clone()))
@@ -1530,15 +1582,16 @@ fn install_archives(
                     ctx.ui.err(&format!("{name}:"));
                     ctx.ui.tree(&conflict_report(conflicts));
                 }
-                None => ctx.ui.warn(&format!(
-                    "{name} is held back along with {}",
-                    because[name]
-                )),
+                None => ctx
+                    .ui
+                    .warn(&format!("{name} is held back along with {}", because[name])),
             }
         }
         if held.len() == manifests.len() {
-            // Nothing left to do: fail the way a single-package transaction
-            // always has, naming the first package that was actually stopped.
+            // Nothing left to do in this call. Not an error here: an update
+            // installs each AUR package with a call of its own, and failing
+            // would stop every package after this one. The caller fails the
+            // transaction with this reason if nothing else went in either.
             let first = &held[0];
             let in_batch = conflicts_of.get(first).is_some_and(|c| {
                 c.iter()
@@ -1546,10 +1599,15 @@ fn install_archives(
             });
             // Not "installed files": a type conflict is about what is on disk,
             // which may be owned by no package at all.
-            return Err(if in_batch {
+            let refusal = if in_batch {
                 format!("{first} conflicts with another package in this transaction")
             } else {
                 format!("{first} conflicts with what is already on disk")
+            };
+            return Ok(Batch {
+                held_back: held,
+                refusal: Some(refusal),
+                ..Batch::default()
             });
         }
         ctx.ui.warn(&format!(
@@ -1733,7 +1791,11 @@ fn install_archives(
         let mut warnings = Vec::new();
         // sysusers needs root and tmpfiles describe system daemons; a
         // per-user prefix has neither, so its packages get no hooks.
-        let hook_files: &[String] = if ctx.user_prefix.is_some() { &[] } else { &files };
+        let hook_files: &[String] = if ctx.user_prefix.is_some() {
+            &[]
+        } else {
+            &files
+        };
         stale_caches.note(hook_files);
         let applied = crate::hooks::apply(&ctx.config.root_dir, hook_files, &mut |w| {
             warnings.push(w.to_string())
@@ -1742,10 +1804,11 @@ fn install_archives(
             ctx.ui.warn(warning);
         }
         if !applied.users.is_empty() {
-            ctx.ui
-                .info(&format!("created system user{}: {}",
-                    if applied.users.len() == 1 { "" } else { "s" },
-                    applied.users.join(", ")));
+            ctx.ui.info(&format!(
+                "created system user{}: {}",
+                if applied.users.len() == 1 { "" } else { "s" },
+                applied.users.join(", ")
+            ));
         }
         if !applied.copied.is_empty() {
             ctx.ui.info(&format!(
@@ -2105,7 +2168,11 @@ fn show_plan(ctx: &Context, plan: &Plan) {
 
     ctx.ui.blank();
 
-    let explicit: Vec<&Resolved> = plan.install.iter().filter(|r| r.reason.is_explicit()).collect();
+    let explicit: Vec<&Resolved> = plan
+        .install
+        .iter()
+        .filter(|r| r.reason.is_explicit())
+        .collect();
     let implicit: Vec<&Resolved> = plan
         .install
         .iter()
@@ -2176,7 +2243,10 @@ fn show_plan(ctx: &Context, plan: &Plan) {
         s.bold(&bytes(plan.download_size())),
         s.bold(&bytes_signed(plan.installed_size_delta())),
         if aur > 0 {
-            format!("   {} to build from source", s.paint(Color::Cyan, &aur.to_string()))
+            format!(
+                "   {} to build from source",
+                s.paint(Color::Cyan, &aur.to_string())
+            )
         } else {
             String::new()
         }
@@ -2774,8 +2844,12 @@ fn build_aur(
     }
 
     if is_repo {
-        run_command(git_command(&dir, identity.as_ref()).arg("pull").arg("--ff-only"))
-            .map_err(|e| format!("git pull failed: {e}"))?;
+        run_command(
+            git_command(&dir, identity.as_ref())
+                .arg("pull")
+                .arg("--ff-only"),
+        )
+        .map_err(|e| format!("git pull failed: {e}"))?;
     } else {
         run_command(
             git_command(&dir, identity.as_ref())
@@ -2955,7 +3029,11 @@ fn run_command(command: &mut Command) -> Result<(), String> {
         Ok(())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(stderr.lines().last().unwrap_or("command failed").to_string())
+        Err(stderr
+            .lines()
+            .last()
+            .unwrap_or("command failed")
+            .to_string())
     }
 }
 
@@ -3017,8 +3095,8 @@ critical = false
         assert!(t.enabled);
 
         // Absent is false, which is what raven-init does with the key.
-        let t = service_definition("[[services]]\nname = \"x\"\nexec = \"/bin/x\"\n")
-            .expect("reads");
+        let t =
+            service_definition("[[services]]\nname = \"x\"\nexec = \"/bin/x\"\n").expect("reads");
         assert!(!t.enabled);
     }
 
@@ -3266,8 +3344,10 @@ critical = false
             Some("go")
         );
         assert_eq!(
-            package_name_from_filename("ttf-material-design-icons-git-v7.4.47.r0.g57b567a-1-any.pkg.tar.zst")
-                .as_deref(),
+            package_name_from_filename(
+                "ttf-material-design-icons-git-v7.4.47.r0.g57b567a-1-any.pkg.tar.zst"
+            )
+            .as_deref(),
             Some("ttf-material-design-icons-git")
         );
         // Too few fields to be a package filename.
@@ -3335,11 +3415,12 @@ critical = false
         );
         let found = collect_artifacts(&dir, &srcinfo).unwrap();
         assert_eq!(found.len(), 2, "both split outputs belong to the build");
-        assert!(found.iter().all(|p| !p
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with("unrelated")));
+        assert!(found.iter().all(|p| {
+            !p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("unrelated")
+        }));
     }
 
     #[test]
@@ -3358,7 +3439,10 @@ critical = false
                       neofetch git repo ... FAILED (unknown public key 46D62DD9F1DE636E)\n\
                       ==> ERROR: One or more PGP signatures could not be verified!";
         let explained = explain_build_failure(output);
-        assert!(explained.contains("gpg --recv-keys 46D62DD9F1DE636E"), "{explained}");
+        assert!(
+            explained.contains("gpg --recv-keys 46D62DD9F1DE636E"),
+            "{explained}"
+        );
     }
 
     #[test]
@@ -3367,7 +3451,10 @@ critical = false
                       permanent, catastrophic damage to your system.";
         let explained = explain_build_failure(output);
         assert!(explained.contains("unprivileged"), "{explained}");
-        assert!(!explained.contains("catastrophic"), "raw text should not leak through");
+        assert!(
+            !explained.contains("catastrophic"),
+            "raw text should not leak through"
+        );
     }
 
     #[test]
@@ -3552,6 +3639,8 @@ critical = false
                 path: "etc/sudoers".into(),
             }],
             held_back: vec!["libpipewire".into()],
+            failed: Vec::new(),
+            refusal: None,
         };
         repo.absorb(Batch {
             installed: vec!["brave-bin".into()],
@@ -3562,6 +3651,8 @@ critical = false
                 path: "etc/brave.conf".into(),
             }],
             held_back: vec!["some-aur-thing".into()],
+            failed: vec!["broken-pkgbuild".into()],
+            refusal: Some("broken-pkgbuild: build failed".into()),
         });
 
         assert_eq!(repo.installed, vec!["sudo", "brave-bin"]);
@@ -3569,6 +3660,11 @@ critical = false
         assert_eq!(repo.stale_preserved.len(), 2);
         assert_eq!(repo.pacnew.len(), 2);
         assert_eq!(repo.held_back, vec!["libpipewire", "some-aur-thing"]);
+        assert_eq!(repo.failed, vec!["broken-pkgbuild"]);
+        assert_eq!(
+            repo.refusal.as_deref(),
+            Some("broken-pkgbuild: build failed")
+        );
         assert_eq!(repo.pacnew[1].package, "brave-bin");
     }
 
@@ -3701,7 +3797,10 @@ critical = false
         assert_eq!(second.len(), 1);
         let text = second[0].to_string();
         assert!(text.contains("usr/bin/x"), "{text}");
-        assert!(text.contains(" a "), "the first claimant must be named: {text}");
+        assert!(
+            text.contains(" a "),
+            "the first claimant must be named: {text}"
+        );
 
         // The path b was alone in shipping is still recorded for whatever
         // comes next in the batch.
@@ -3789,11 +3888,21 @@ critical = false
         };
 
         let archives = vec![("a".to_string(), a), ("b".to_string(), b)];
-        let err = match install_archives(&mut ctx, &plan, &archives, &HashMap::new()) {
-            Err(e) => e,
-            Ok(_) => panic!("two packages shipping usr/bin/x must be refused"),
+        // Refused, but as a held-back batch rather than an error: an update
+        // installs each AUR package in a call of its own, and an error here
+        // would stop every package after it.
+        let batch = match install_archives(&mut ctx, &plan, &archives, &HashMap::new()) {
+            Ok(batch) => batch,
+            Err(e) => panic!("a conflict is reported in the batch, not as an error: {e}"),
         };
-        assert!(err.contains("this transaction"), "{err}");
+        assert!(batch.installed.is_empty());
+        let mut held = batch.held_back.clone();
+        held.sort();
+        assert_eq!(held, ["a", "b"]);
+        let refusal = batch
+            .refusal
+            .expect("two packages shipping usr/bin/x must be refused");
+        assert!(refusal.contains("this transaction"), "{refusal}");
 
         // And refused before anything was written.
         assert!(
@@ -3879,7 +3988,9 @@ critical = false
             header.set_size(2);
             header.set_mode(0o644);
             header.set_cksum();
-            builder.append_data(&mut header, member, &b"2\n"[..]).unwrap();
+            builder
+                .append_data(&mut header, member, &b"2\n"[..])
+                .unwrap();
         }
         std::fs::write(&libfoo, builder.into_inner().unwrap()).unwrap();
         let foo = dir.join("foo.tar");
@@ -3898,7 +4009,11 @@ critical = false
         assert!(batch.held_back.is_empty());
 
         let module = ctx.config.root_dir.join("usr/lib/foo/module.so");
-        assert_eq!(std::fs::read(&module).unwrap(), b"2\n", "the new owner's copy stays");
+        assert_eq!(
+            std::fs::read(&module).unwrap(),
+            b"2\n",
+            "the new owner's copy stays"
+        );
         assert_eq!(
             ctx.local.files("foo").unwrap(),
             ["usr/bin/foo"],
@@ -3945,9 +4060,18 @@ critical = false
         assert_eq!(batch.held_back, ["bad", "user"]);
 
         let root = &ctx.config.root_dir;
-        assert_eq!(std::fs::read(root.join("usr/bin/taken")).unwrap(), b"bystander 1\n");
-        assert_eq!(std::fs::read(root.join("usr/bin/user")).unwrap(), b"user 1\n");
-        assert_eq!(std::fs::read(root.join("usr/bin/fine")).unwrap(), b"fine 2\n");
+        assert_eq!(
+            std::fs::read(root.join("usr/bin/taken")).unwrap(),
+            b"bystander 1\n"
+        );
+        assert_eq!(
+            std::fs::read(root.join("usr/bin/user")).unwrap(),
+            b"user 1\n"
+        );
+        assert_eq!(
+            std::fs::read(root.join("usr/bin/fine")).unwrap(),
+            b"fine 2\n"
+        );
     }
 
     // The sentence is the whole of the report for anyone who reads one line

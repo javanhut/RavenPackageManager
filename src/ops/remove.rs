@@ -24,11 +24,7 @@ pub fn run(ctx: &mut Context, targets: &[String], options: Options) -> Result<Ou
 }
 
 /// The removal pipeline without the masthead.
-pub fn execute(
-    ctx: &mut Context,
-    targets: &[String],
-    options: Options,
-) -> Result<Outcome, String> {
+pub fn execute(ctx: &mut Context, targets: &[String], options: Options) -> Result<Outcome, String> {
     let plan = {
         let spinner = ctx.ui.stage(&format!("checking {}", targets.join(", ")));
         let plan = remove::plan_with(&ctx.local, &ctx.system, targets, options);
@@ -221,8 +217,12 @@ pub fn apply(ctx: &mut Context, plan: &RemovalPlan) -> Result<Outcome, String> {
             None,
         );
 
-        let files = remove::deletable_files(&ctx.local, pkg, &removing)
-            .map_err(|e| format!("{}: could not determine which files to delete: {e}", pkg.name))?;
+        let files = remove::deletable_files(&ctx.local, pkg, &removing).map_err(|e| {
+            format!(
+                "{}: could not determine which files to delete: {e}",
+                pkg.name
+            )
+        })?;
         // A per-user prefix is not what the system caches index.
         if ctx.user_prefix.is_none() {
             stale_caches.note(&files);
@@ -345,11 +345,7 @@ pub(crate) enum Retirement {
 /// lost either way, so the policy lives here once. `prune_stale` used to
 /// unlink unconditionally, which is how a config file that a new upstream
 /// version merely *relocated* took the administrator's edits with it.
-pub(crate) fn retire_file(
-    pkg: &crate::pkg::Package,
-    file: &str,
-    path: &Path,
-) -> Retirement {
+pub(crate) fn retire_file(pkg: &crate::pkg::Package, file: &str, path: &Path) -> Retirement {
     if pkg.is_backup(file) && path.exists() && was_modified(pkg, file, path) {
         // An edited configuration file is never destroyed; it is set aside so
         // an administrator can recover or discard it. One still matching what
@@ -470,20 +466,22 @@ fn show_plan(ctx: &Context, plan: &RemovalPlan) {
             if plan.orphaned.contains(&pkg.name) {
                 line.push_str(&format!(" {}", s.dim("(orphaned)")));
             } else if plan.cascaded.contains(&pkg.name) {
-                line.push_str(&format!(" {}", s.paint(Color::Amber, "(depends on a target)")));
+                line.push_str(&format!(
+                    " {}",
+                    s.paint(Color::Amber, "(depends on a target)")
+                ));
             }
             line
         })
         .collect();
 
-    ctx.ui.step(&format!("packages to remove ({})", lines.len()));
+    ctx.ui
+        .step(&format!("packages to remove ({})", lines.len()));
     ctx.ui.tree(&lines);
 
     ctx.ui.blank();
-    ctx.ui.info(&format!(
-        "freeing {}",
-        s.bold(&bytes(plan.freed_size()))
-    ));
+    ctx.ui
+        .info(&format!("freeing {}", s.bold(&bytes(plan.freed_size()))));
     ctx.ui.blank();
 }
 

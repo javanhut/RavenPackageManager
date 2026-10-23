@@ -263,7 +263,12 @@ impl Source for Aur {
             return None;
         }
         let key = dep.to_string();
-        if let Some(hit) = self.providers.lock().ok().and_then(|c| c.get(&key).cloned()) {
+        if let Some(hit) = self
+            .providers
+            .lock()
+            .ok()
+            .and_then(|c| c.get(&key).cloned())
+        {
             return hit;
         }
         let found = self
@@ -563,6 +568,9 @@ pkgname = mytool-docs
 
     #[test]
     fn builds_git_url() {
-        assert_eq!(Aur::git_url("spotify"), "https://aur.archlinux.org/spotify.git");
+        assert_eq!(
+            Aur::git_url("spotify"),
+            "https://aur.archlinux.org/spotify.git"
+        );
     }
 }

@@ -132,10 +132,7 @@ fn is_orphan(local: &LocalDb, candidate: &Package, removing: &HashSet<String>) -
 
 /// Orders a removal set so dependents come before what they depend on.
 fn removal_order(local: &LocalDb, names: &HashSet<String>) -> Vec<Package> {
-    let mut remaining: Vec<Package> = names
-        .iter()
-        .filter_map(|n| local.get(n).cloned())
-        .collect();
+    let mut remaining: Vec<Package> = names.iter().filter_map(|n| local.get(n).cloned()).collect();
     remaining.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut ordered = Vec::new();
@@ -345,10 +342,7 @@ mod tests {
 
     #[test]
     fn removes_a_leaf_package() {
-        let local = db(
-            "leaf",
-            vec![pkg("app", &[], InstallReason::Explicit)],
-        );
+        let local = db("leaf", vec![pkg("app", &[], InstallReason::Explicit)]);
         let plan = plan(&local, &["app".into()], Options::default());
         assert_eq!(names(&plan), vec!["app"]);
         assert!(plan.blocked.is_empty());
@@ -576,7 +570,11 @@ mod tests {
 
         let local = db(
             "two-providers",
-            vec![pkg("app", &["java-runtime"], InstallReason::Explicit), alt, old],
+            vec![
+                pkg("app", &["java-runtime"], InstallReason::Explicit),
+                alt,
+                old,
+            ],
         );
 
         // Removing one provider is fine while the other still satisfies it.
@@ -594,7 +592,11 @@ mod tests {
 
         let local = db(
             "all-providers",
-            vec![pkg("app", &["java-runtime"], InstallReason::Explicit), alt, old],
+            vec![
+                pkg("app", &["java-runtime"], InstallReason::Explicit),
+                alt,
+                old,
+            ],
         );
 
         let plan = plan(

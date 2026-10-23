@@ -324,10 +324,10 @@ fn verify_database(ctx: &Context, repo: &Repo, dest: &Path) -> Result<Verified, 
         }
     }
 
-    let keyring = ctx
-        .keyring()
-        .ok_or("the pacman keyring could not be read, so the database signature \
-                cannot be checked")?;
+    let keyring = ctx.keyring().ok_or(
+        "the pacman keyring could not be read, so the database signature \
+                cannot be checked",
+    )?;
 
     let data = std::fs::read(dest).map_err(|e| e.to_string())?;
     let signature = std::fs::read(&sig_dest).map_err(|e| e.to_string())?;
@@ -438,8 +438,20 @@ mod tests {
         let system = scratch("fresher-system");
         let user = scratch("fresher-user");
         let repos = vec!["core".to_string(), "extra".to_string()];
-        copy_with(&system, &[("core", Duration::from_secs(3600)), ("extra", Duration::from_secs(3600))]);
-        copy_with(&user, &[("core", Duration::from_secs(60)), ("extra", Duration::from_secs(60))]);
+        copy_with(
+            &system,
+            &[
+                ("core", Duration::from_secs(3600)),
+                ("extra", Duration::from_secs(3600)),
+            ],
+        );
+        copy_with(
+            &user,
+            &[
+                ("core", Duration::from_secs(60)),
+                ("extra", Duration::from_secs(60)),
+            ],
+        );
         assert!(user_copy_is_fresher(&repos, &system, &user));
     }
 
@@ -458,7 +470,13 @@ mod tests {
         let system = scratch("partial-system");
         let user = scratch("partial-user");
         let repos = vec!["core".to_string(), "extra".to_string()];
-        copy_with(&system, &[("core", Duration::from_secs(3600)), ("extra", Duration::from_secs(3600))]);
+        copy_with(
+            &system,
+            &[
+                ("core", Duration::from_secs(3600)),
+                ("extra", Duration::from_secs(3600)),
+            ],
+        );
         copy_with(&user, &[("core", Duration::from_secs(60))]);
         assert!(!user_copy_is_fresher(&repos, &system, &user));
     }
@@ -470,8 +488,20 @@ mod tests {
         let system = scratch("mixed-system");
         let user = scratch("mixed-user");
         let repos = vec!["core".to_string(), "extra".to_string()];
-        copy_with(&system, &[("core", Duration::from_secs(3600)), ("extra", Duration::from_secs(60))]);
-        copy_with(&user, &[("core", Duration::from_secs(60)), ("extra", Duration::from_secs(3600))]);
+        copy_with(
+            &system,
+            &[
+                ("core", Duration::from_secs(3600)),
+                ("extra", Duration::from_secs(60)),
+            ],
+        );
+        copy_with(
+            &user,
+            &[
+                ("core", Duration::from_secs(60)),
+                ("extra", Duration::from_secs(3600)),
+            ],
+        );
         assert!(!user_copy_is_fresher(&repos, &system, &user));
     }
 
