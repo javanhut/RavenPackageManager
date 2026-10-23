@@ -855,7 +855,7 @@ fn main() -> ExitCode {
                     .into_iter()
                     .map(|pkg| {
                         let mut v = rvn::ui::json::package(pkg);
-                        v["aur"] = serde_json::Value::Bool(ops::query::is_foreign(&ctx, pkg));
+                        v["aur"] = serde_json::Value::Bool(ops::query::is_aur(&ctx, pkg));
                         v["explicit"] = serde_json::Value::Bool(
                             pkg.install_reason == rvn::pkg::InstallReason::Explicit,
                         );

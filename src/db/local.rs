@@ -251,7 +251,11 @@ impl LocalDb {
         field("SIZE", &[pkg.isize.to_string()]);
         field("REASON", &[pkg.install_reason.as_code().to_string()]);
         field("VALIDATION", &[pkg.validation.as_str().to_string()]);
-        field("XDATA", &["pkgtype=pkg".to_string()]);
+        let mut xdata = vec!["pkgtype=pkg".to_string()];
+        if let Some(origin) = &pkg.installed_from {
+            xdata.push(format!("{}={}", desc::ORIGIN_XDATA, origin.to_record()));
+        }
+        field("XDATA", &xdata);
         field(
             "BACKUP",
             &pkg.backup.iter().map(|b| b.to_entry()).collect::<Vec<_>>(),
@@ -581,6 +585,38 @@ mod tests {
         let reread = LocalDb::load(&root);
         assert_eq!(reread.packages.len(), 1);
         assert_eq!(reread.get("app").unwrap().version, "2.0-1");
+    }
+
+    #[test]
+    fn records_where_a_package_was_installed_from() {
+        let root = temp_root("installed-from");
+        let mut db = LocalDb::load(&root);
+        for (name, from) in [
+            ("yay", Some(Origin::Aur)),
+            ("go", Some(Origin::Repo("extra".into()))),
+            ("crow", Some(Origin::Local)),
+            ("legacy", None),
+        ] {
+            let pkg = Package {
+                name: name.into(),
+                version: "1.0-1".into(),
+                installed_from: from,
+                ..Default::default()
+            };
+            db.register(&pkg, &[]).unwrap();
+        }
+
+        let reread = LocalDb::load(&root);
+        let from = |name: &str| reread.get(name).unwrap().installed_from.clone();
+        assert_eq!(from("yay"), Some(Origin::Aur));
+        assert_eq!(from("go"), Some(Origin::Repo("extra".into())));
+        assert_eq!(from("crow"), Some(Origin::Local));
+        assert_eq!(from("legacy"), None);
+
+        // Kept in `%XDATA%`, beside the entry pacman itself writes there, so
+        // that pacman preserves it when it rewrites the record.
+        let desc = std::fs::read_to_string(root.join("yay-1.0-1/desc")).unwrap();
+        assert!(desc.contains("%XDATA%\npkgtype=pkg\nrvn-origin=aur\n"), "{desc}");
     }
 
     #[test]

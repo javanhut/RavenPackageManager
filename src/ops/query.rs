@@ -63,10 +63,11 @@ pub fn info(ctx: &Context, names: &[String]) -> Result<(), String> {
 
         let installed = ctx.local.get(name);
         let repo = repo_entry(ctx, name);
-        let origin = match (installed.is_some(), repo) {
+        let origin = match (installed, repo) {
             (_, Some(r)) => r.origin.clone(),
-            (true, None) => Origin::Aur,
-            (false, None) => pkg.origin.clone(),
+            (Some(local), None) if local.recorded_from_aur() => Origin::Aur,
+            (Some(_), None) => Origin::Local,
+            (None, None) => pkg.origin.clone(),
         };
 
         let field = |label: &str, value: &str| {
@@ -170,6 +171,14 @@ pub fn is_foreign(ctx: &Context, pkg: &Package) -> bool {
     ctx.sync.iter().all(|db| db.get(&pkg.name).is_none())
 }
 
+/// Whether an installed package is an AUR package: one no configured
+/// repository carries that rvn recorded installing from the AUR. The rest of
+/// the foreign packages are local ones, whatever the AUR has under their
+/// names.
+pub fn is_aur(ctx: &Context, pkg: &Package) -> bool {
+    is_foreign(ctx, pkg) && pkg.recorded_from_aur()
+}
+
 /// The installed packages `rvn list` would show, sorted by name.
 pub fn installed(ctx: &Context, filter: ListFilter) -> Vec<&Package> {
     let mut packages: Vec<&Package> = ctx.local.packages.values().collect();
@@ -208,11 +217,11 @@ pub fn installed(ctx: &Context, filter: ListFilter) -> Vec<&Package> {
 pub fn list(ctx: &Context, filter: ListFilter) -> Result<usize, String> {
     let s = &ctx.ui.style;
     let selected = installed(ctx, filter);
-    let is_foreign = |pkg: &Package| is_foreign(ctx, pkg);
-
     for pkg in &selected {
-        let tag = if is_foreign(pkg) {
+        let tag = if is_aur(ctx, pkg) {
             s.paint(Color::Cyan, "aur")
+        } else if is_foreign(ctx, pkg) {
+            s.paint(Color::Slate, "local")
         } else {
             s.paint(Color::Violet, "repo")
         };

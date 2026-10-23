@@ -460,6 +460,9 @@ impl<'a> Reader<'a> {
                 2 => Validation::Pgp,
                 _ => return None,
             },
+            // Only a local record says where a package was installed from,
+            // and this cache holds sync databases.
+            installed_from: None,
         })
     }
 }
@@ -507,6 +510,8 @@ mod tests {
             base: Some("go".into()),
             build_date: 1_700_000_000,
             validation: Validation::Pgp,
+            // Never encoded: a sync database does not record it.
+            installed_from: None,
         }
     }
 

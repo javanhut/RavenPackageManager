@@ -82,19 +82,23 @@ pub fn candidates(
                 }),
                 Ordering::Equal => {}
             },
-            // Not in any repository: it came from the AUR, so ask the AUR.
+            // Not in any repository, which makes it the AUR's only if it
+            // came from there: a package built locally can share its name
+            // with an unrelated one on the AUR, and "upgrading" it would
+            // build that over it.
             None => {
-                if let Some(candidate) = aur.get(&pkg.name) {
-                    if vercmp(&candidate.version, &pkg.version) == Ordering::Greater {
-                        out.push(Candidate {
-                            name: pkg.name.clone(),
-                            installed_version: pkg.version.clone(),
-                            new_version: candidate.version.clone(),
-                            origin: Origin::Aur,
-                            kind: Kind::Upgrade,
-                            download_size: 0,
-                        });
-                    }
+                if let Some(candidate) = aur.get(&pkg.name)
+                    && pkg.is_same_aur_package(&candidate)
+                    && vercmp(&candidate.version, &pkg.version) == Ordering::Greater
+                {
+                    out.push(Candidate {
+                        name: pkg.name.clone(),
+                        installed_version: pkg.version.clone(),
+                        new_version: candidate.version.clone(),
+                        origin: Origin::Aur,
+                        kind: Kind::Upgrade,
+                        download_size: 0,
+                    });
                 }
             }
         }
@@ -194,11 +198,14 @@ mod tests {
     }
 
     fn local_db(tag: &str, packages: Vec<Package>) -> LocalDb {
-        let mut db = LocalDb::load(&temp_root(tag));
+        let root = temp_root(tag);
+        let mut db = LocalDb::load(&root);
         for p in packages {
             db.register(&p, &[format!("usr/bin/{}", p.name)]).unwrap();
         }
-        db
+        // Read back from disk, so what `candidates` sees is what the record
+        // actually kept -- the origin above all.
+        LocalDb::load(&root)
     }
 
     struct NoAur;
@@ -286,8 +293,9 @@ mod tests {
 
     #[test]
     fn aur_packages_are_checked_against_the_aur() {
-        let local = local_db("aur", vec![pkg("mytool", "0.1.0-1")]);
-        // Empty repos, so the package can only have come from the AUR.
+        let mut mytool = pkg("mytool", "0.1.0-1");
+        mytool.installed_from = Some(Origin::Aur);
+        let local = local_db("aur", vec![mytool]);
         let sync = sync_db(vec![]);
         let aur = FakeAur(vec![Package {
             name: "mytool".into(),
@@ -300,6 +308,69 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].origin, Origin::Aur);
         assert_eq!(found[0].new_version, "0.2.0-1");
+    }
+
+    /// An AUR package one version ahead of `installed`, with the given URL.
+    fn aur_namesake(installed: &Package, url: &str) -> FakeAur {
+        FakeAur(vec![Package {
+            name: installed.name.clone(),
+            version: "1.3.4-1".into(),
+            url: Some(url.into()),
+            origin: Origin::Aur,
+            ..Default::default()
+        }])
+    }
+
+    #[test]
+    fn a_local_package_is_not_upgraded_to_its_aur_namesake() {
+        // Raven's own text editor, built locally; the AUR's `crow` is an
+        // unrelated C++ web framework.
+        let mut crow = pkg("crow", "0.1.0-1");
+        crow.url = Some("https://github.com/javanhut/CrowTextEditor".into());
+        crow.installed_from = Some(Origin::Local);
+        let aur = aur_namesake(&crow, "https://github.com/javanhut/CrowTextEditor");
+        let local = local_db("local-namesake", vec![crow]);
+
+        // Even a matching URL does not override what was recorded.
+        assert!(candidates(&local, &sync_db(vec![]), &aur, None).is_empty());
+    }
+
+    #[test]
+    fn a_package_dropped_from_its_repository_is_not_taken_for_the_aurs() {
+        let mut tool = pkg("tool", "1.0-1");
+        tool.installed_from = Some(Origin::Repo("extra".into()));
+        let aur = aur_namesake(&tool, "https://example.org/tool");
+        let local = local_db("dropped-namesake", vec![tool]);
+
+        assert!(candidates(&local, &sync_db(vec![]), &aur, None).is_empty());
+    }
+
+    #[test]
+    fn an_unrecorded_package_matches_the_aur_only_by_url() {
+        // Written by pacman or an older rvn, so nothing says where it came
+        // from.
+        let mut crow = pkg("crow", "0.1.0-1");
+        crow.url = Some("https://github.com/javanhut/CrowTextEditor".into());
+        let mut brave = pkg("brave-bin", "1.0-1");
+        brave.url = Some("https://brave.com".into());
+        let mut bare = pkg("bare", "1.0-1");
+        bare.url = None;
+
+        let aur = FakeAur(
+            [
+                aur_namesake(&crow, "https://crowcpp.org"),
+                aur_namesake(&brave, "https://brave.com/"),
+                aur_namesake(&bare, "https://example.org/bare"),
+            ]
+            .into_iter()
+            .flat_map(|a| a.0)
+            .collect(),
+        );
+        let local = local_db("unrecorded", vec![crow, brave, bare]);
+
+        let found = candidates(&local, &sync_db(vec![]), &aur, None);
+        let names: Vec<&str> = found.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["brave-bin"]);
     }
 
     #[test]

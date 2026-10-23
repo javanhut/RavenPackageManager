@@ -28,6 +28,31 @@ impl Origin {
     pub fn is_aur(&self) -> bool {
         matches!(self, Origin::Aur)
     }
+
+    /// The value recorded for this origin in a local `desc` record.
+    ///
+    /// A repository is spelled `repo:<name>` rather than by its bare name so
+    /// that a repository called `aur` or `local` cannot read back as one of
+    /// the other two.
+    pub fn to_record(&self) -> String {
+        match self {
+            Origin::Repo(name) => format!("repo:{name}"),
+            Origin::Aur => "aur".to_string(),
+            Origin::Local => "local".to_string(),
+        }
+    }
+
+    /// Reads back what [`Origin::to_record`] wrote, and nothing else.
+    pub fn from_record(value: &str) -> Option<Origin> {
+        match value {
+            "aur" => Some(Origin::Aur),
+            "local" => Some(Origin::Local),
+            _ => value
+                .strip_prefix("repo:")
+                .filter(|name| !name.is_empty())
+                .map(|name| Origin::Repo(name.to_string())),
+        }
+    }
 }
 
 impl fmt::Display for Origin {
@@ -270,6 +295,12 @@ pub struct Package {
     pub build_date: u64,
     /// How the package was verified at install time.
     pub validation: Validation,
+    /// Where an installed package was installed from, as rvn recorded it at
+    /// the time. `None` for a record written by pacman, another AUR helper or
+    /// an rvn that predates the record -- which is not the same as `Local`:
+    /// nothing is known about those, where `Local` is known not to be a
+    /// repository's or the AUR's.
+    pub installed_from: Option<Origin>,
 }
 
 impl Default for Origin {
@@ -303,11 +334,79 @@ impl Package {
         }
         self.provides.iter().any(|p| dep.satisfied_by_provide(p))
     }
+
+    /// Whether rvn recorded installing this package from the AUR.
+    ///
+    /// A package no repository carries is not thereby an AUR package: Raven
+    /// builds its own software into packages too, and a name like `crow` is
+    /// as likely to be taken on the AUR by something else entirely.
+    pub fn recorded_from_aur(&self) -> bool {
+        self.installed_from.as_ref().is_some_and(Origin::is_aur)
+    }
+
+    /// Whether the AUR's `candidate` is this installed package, rather than an
+    /// unrelated one that happens to share its name.
+    ///
+    /// Where rvn recorded the origin, that settles it. A record without one
+    /// predates it, and the best evidence left is the upstream URL: the AUR
+    /// reports the `url` of the same PKGBUILD the installed package was built
+    /// from, so the two agree for the AUR's own package and differ for a
+    /// namesake.
+    pub fn is_same_aur_package(&self, candidate: &Package) -> bool {
+        match &self.installed_from {
+            Some(origin) => origin.is_aur(),
+            None => match (self.url.as_deref(), candidate.url.as_deref()) {
+                (Some(ours), Some(theirs)) => same_url(ours, theirs),
+                // No URL on one side is no evidence either way, and building
+                // the wrong package over this one costs more than a missed
+                // update.
+                _ => false,
+            },
+        }
+    }
+}
+
+/// Whether two package URLs name the same place, ignoring the differences
+/// PKGBUILDs commonly have between versions: the scheme, a trailing slash, and
+/// letter case.
+fn same_url(a: &str, b: &str) -> bool {
+    fn normalise(url: &str) -> String {
+        let url = url.trim();
+        let url = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .unwrap_or(url);
+        url.trim_end_matches('/').to_ascii_lowercase()
+    }
+    let (a, b) = (normalise(a), normalise(b));
+    !a.is_empty() && a == b
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn origins_round_trip_through_their_record() {
+        for origin in [Origin::Aur, Origin::Local, Origin::Repo("extra".into())] {
+            assert_eq!(Origin::from_record(&origin.to_record()), Some(origin));
+        }
+        // A repository named like the other two stays a repository.
+        let aur_repo = Origin::Repo("aur".into());
+        assert_eq!(Origin::from_record(&aur_repo.to_record()), Some(aur_repo));
+        assert_eq!(Origin::from_record("extra"), None);
+        assert_eq!(Origin::from_record("repo:"), None);
+    }
+
+    #[test]
+    fn urls_compare_without_scheme_case_or_trailing_slash() {
+        assert!(same_url("https://brave.com/", "http://Brave.com"));
+        assert!(!same_url(
+            "https://crowcpp.org",
+            "https://github.com/javanhut/CrowTextEditor"
+        ));
+        assert!(!same_url("", " "));
+    }
 
     #[test]
     fn parses_unversioned() {

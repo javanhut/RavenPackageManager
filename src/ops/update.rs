@@ -61,12 +61,15 @@ pub fn run(ctx: &mut Context, targets: &[String], refresh: bool) -> Result<Outco
         };
 
         // Ask about every AUR package in one batch rather than one request
-        // per package.
+        // per package. A package rvn recorded installing from somewhere else
+        // is not one, whatever the AUR has under its name; one with no record
+        // is asked about, and `upgrade::candidates` decides from the answer.
         let foreign: Vec<String> = ctx
             .local
             .packages
             .values()
             .filter(|p| ctx.sync.iter().all(|db| db.get(&p.name).is_none()))
+            .filter(|p| p.installed_from.as_ref().is_none_or(|o| o.is_aur()))
             .filter(|p| only.map(|t| t.contains(&p.name)).unwrap_or(true))
             .map(|p| p.name.clone())
             .collect();

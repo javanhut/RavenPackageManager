@@ -70,6 +70,25 @@ pub fn is_safe_archive_name(name: &str) -> bool {
         && !name.contains('\0')
 }
 
+/// The `%XDATA%` key under which rvn records where it installed a package from.
+///
+/// `%XDATA%` and not a key of rvn's own: pacman warns about a `desc` key it
+/// does not know and drops it the next time it rewrites the record, whereas it
+/// keeps every `%XDATA%` entry, whatever its name, as it found it.
+pub const ORIGIN_XDATA: &str = "rvn-origin";
+
+/// The origin rvn recorded in a local `desc` record, if it recorded one.
+fn recorded_origin(fields: &HashMap<String, Vec<String>>) -> Option<Origin> {
+    list(fields, "XDATA").iter().find_map(|entry| {
+        let (key, value) = entry.split_once('=')?;
+        if key == ORIGIN_XDATA {
+            Origin::from_record(value)
+        } else {
+            None
+        }
+    })
+}
+
 /// Builds a [`Package`] from a parsed desc record.
 pub fn package_from_fields(fields: &HashMap<String, Vec<String>>, origin: Origin) -> Option<Package> {
     let name = one(fields, "NAME")?;
@@ -123,6 +142,7 @@ pub fn package_from_fields(fields: &HashMap<String, Vec<String>>, origin: Origin
             Some("sha256") => Validation::Sha256,
             _ => Validation::None,
         },
+        installed_from: recorded_origin(fields),
     })
 }
 

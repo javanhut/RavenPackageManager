@@ -92,6 +92,7 @@ impl RpcPackage {
             base: None,
             build_date: 0,
             validation: crate::pkg::Validation::default(),
+            installed_from: None,
         }
     }
 }

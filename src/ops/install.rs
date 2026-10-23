@@ -1667,6 +1667,14 @@ fn install_archives(
 
         let mut record = resolved.package.clone();
         apply_pkginfo(&mut record, &manifest.pkginfo);
+        // Recorded so that `rvn update` asks the AUR only about what came
+        // from it. `Local` is what a reinstall from the cache says when no
+        // repository carries the name, which says nothing about where the
+        // package first came from -- so the previous record's answer stands.
+        record.installed_from = match &resolved.package.origin {
+            crate::pkg::Origin::Local => ctx.local.get(name).and_then(|p| p.installed_from.clone()),
+            origin => Some(origin.clone()),
+        };
         record.backup = manifest
             .backup
             .iter()
